@@ -1,0 +1,22 @@
+[package]
+name = "nls-proxy-priv"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nls-proxy-priv"
+path = "src/main.rs"
+
+[dependencies]
+nls-proxy-wire = { path = "../wire" }
+nls-proxy-scm = { path = "../scm" }
+nix = { workspace = true }
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

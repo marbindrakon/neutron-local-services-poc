@@ -1,0 +1,1 @@
+LOCAL_SERVICES_VERSION_TABLE = 'alembic_version_local_services'

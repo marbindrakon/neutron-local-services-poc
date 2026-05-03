@@ -1,0 +1,12 @@
+# DevStack settings for neutron-local-services
+#
+# Sourced by DevStack early; defaults can be overridden in local.conf.
+
+# Where the agent extension reads/writes process state, configs, etc.
+NEUTRON_LOCAL_SERVICES_STATE_DIR=${NEUTRON_LOCAL_SERVICES_STATE_DIR:-/var/lib/neutron-local-services}
+
+# Default reconciler interval for the agent extension.
+NEUTRON_LOCAL_SERVICES_RECONCILER_INTERVAL=${NEUTRON_LOCAL_SERVICES_RECONCILER_INTERVAL:-10}
+
+# Service flag — DevStack uses this to gate plugin behaviors. Default on.
+enable_service neutron-local-services

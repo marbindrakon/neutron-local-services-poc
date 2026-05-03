@@ -1,0 +1,93 @@
+# Compute-only DevStack local.conf for the neutron-local-services PoC
+# multi-chassis (#2) lab. This node runs:
+#   - nova-compute (n-cpu)
+#   - ovn-controller (talks to the controller's OVN SB)
+#   - ovn-agent (with the local-services extension layered on)
+#
+# The controller node (controller's HOST_IP, e.g. 172.18.0.128) hosts:
+#   - neutron-server, ovn-northd, MySQL, RabbitMQ, Keystone, Glance,
+#     Placement, nova-api, nova-conductor, nova-scheduler.
+#
+# Bring-up order: stack the controller first (single-node config from
+# local.conf.sample). Once it's stable and ovn-sbctl shows one chassis,
+# bring this compute up. The agent extension auto-registers under the
+# ovn-agent the same way it does on the controller; OVN SB will gain a
+# Chassis row for this host on first ovn-controller startup.
+#
+# To use:
+#   1. Set HOST_IP to this node's IP (the lab-infra address).
+#   2. Set SERVICE_HOST to the controller's IP.
+#   3. Make sure ADMIN_PASSWORD matches the controller's local.conf.
+#   4. Bootstrap (lab-bootstrap.sh) and then `./stack.sh` as stack.
+
+[[local|localrc]]
+
+# --- Topology --------------------------------------------------------------
+# OVERRIDE per-node before stack.sh:
+HOST_IP=__COMPUTE_HOST_IP__
+SERVICE_HOST=__CONTROLLER_HOST_IP__
+
+# Service endpoints all live on the controller.
+MYSQL_HOST=$SERVICE_HOST
+RABBIT_HOST=$SERVICE_HOST
+GLANCE_HOSTPORT=$SERVICE_HOST:9292
+KEYSTONE_AUTH_URI=http://$SERVICE_HOST/identity
+KEYSTONE_SERVICE_URI=http://$SERVICE_HOST/identity
+
+# Match the controller's passwords. Default sample uses 'password'.
+ADMIN_PASSWORD=password
+DATABASE_PASSWORD=password
+RABBIT_PASSWORD=password
+SERVICE_PASSWORD=password
+SERVICE_TOKEN=password
+
+# Even though MySQL runs only on the controller, DevStack's lib/database
+# needs DATABASE_TYPE so it can construct the per-service connection
+# URLs (nova-compute → MySQL on $SERVICE_HOST). Without this we get
+# "database_connection_url_: command not found" mid-run because no
+# lib/databases/<driver>.sh got sourced. mysql matches the controller.
+DATABASE_TYPE=mysql
+
+# --- Service set: compute only --------------------------------------------
+disable_all_services
+enable_service n-cpu
+enable_service placement-client
+enable_service ovn-controller
+enable_service neutron-ovn-agent
+enable_service q-trunk
+# We deliberately do NOT enable: q-svc, neutron-api, ovn-northd,
+# ovn-northd-db, mysql, rabbit, keystone, g-api, n-api, n-cond,
+# placement-api — those are the controller's job.
+
+# --- Plugins --------------------------------------------------------------
+# We need neutron's tree on this node so the ovn-agent binary exists,
+# and our PoC so the agent extension entry point + DevStack plugin's
+# init/post-config (which writes ovn_agent.ini for the extension) run.
+enable_plugin neutron https://opendev.org/openstack/neutron
+enable_plugin neutron-local-services /opt/stack/neutron-local-services
+
+# --- OVN ------------------------------------------------------------------
+Q_AGENT=ovn
+Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn
+Q_ML2_PLUGIN_TYPE_DRIVERS=local,flat,vlan,geneve
+Q_ML2_TENANT_NETWORK_TYPE=geneve
+
+# Point ovn-controller at the controller's OVN SB. The controller's
+# ovsdb-server listens on 6641/6642 on 0.0.0.0 by default in DevStack
+# multinode shape. (Verified on the lab controller via
+# `netstat -tlnp | grep 664[12]`.)
+OVN_NB_REMOTE=tcp:$SERVICE_HOST:6641
+OVN_SB_REMOTE=tcp:$SERVICE_HOST:6642
+
+# Each compute is also a gateway chassis — keeps the lab simple, lets
+# floating-ip / l3 traffic land on whichever chassis hosts the port.
+ENABLE_CHASSIS_AS_GW=True
+
+# --- Misc -----------------------------------------------------------------
+# Single API worker matches the controller's pin; no API workers run
+# here anyway, but the variable is read by neutron-cfg-agent if any
+# stray service does start.
+API_WORKERS=1
+
+LOGFILE=$DEST/logs/stack.sh.log
+LOGDAYS=1

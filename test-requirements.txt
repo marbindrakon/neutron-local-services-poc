@@ -1,0 +1,4 @@
+stestr>=3.2.0
+testtools>=2.5.0
+fixtures>=3.0.0
+oslotest>=4.5.0

@@ -1,0 +1,58 @@
+# Sample local.conf for testing the neutron-local-services PoC on a
+# single-node Alma 10 DevStack.
+
+[[local|localrc]]
+
+ADMIN_PASSWORD=password
+DATABASE_PASSWORD=password
+RABBIT_PASSWORD=password
+SERVICE_PASSWORD=password
+SERVICE_TOKEN=password
+
+# OVN
+Q_AGENT=ovn
+Q_ML2_PLUGIN_MECHANISM_DRIVERS=ovn
+Q_ML2_PLUGIN_TYPE_DRIVERS=local,flat,vlan,geneve
+Q_ML2_TENANT_NETWORK_TYPE=geneve
+
+# Use the OVN-agent (with metadata + local-services extensions)
+# rather than the deprecated standalone metadata agent.
+disable_service q-ovn-metadata-agent
+enable_service neutron-ovn-agent
+
+enable_service ovn-northd
+enable_service ovn-controller
+enable_service q-svc
+
+disable_service q-agt
+disable_service q-l3
+disable_service q-dhcp
+disable_service q-meta
+
+# Neutron and our plugin
+enable_plugin neutron https://opendev.org/openstack/neutron
+enable_plugin neutron-local-services /opt/stack/neutron-local-services
+enable_service q-trunk
+enable_service q-dns
+enable_service q-port-forwarding
+enable_service q-qos
+
+# Disable Octavia — we PoC-conflict with the OVN provider; toggle this
+# back on once the proper LSP-type extensibility patch lands upstream.
+# enable_plugin octavia https://opendev.org/openstack/octavia
+# enable_plugin ovn-octavia-provider https://opendev.org/openstack/ovn-octavia-provider
+
+# Disable Cinder/Horizon to speed up bring-up.
+disable_service horizon
+disable_service cinder c-sch c-api c-vol
+
+ENABLE_CHASSIS_AS_GW=True
+
+# Pin to 1 API worker. Multi-worker startup races on
+# ml2_geneve_allocations sync (workers concurrently DELETE+INSERT in
+# `_sync_allocations`, leaving the table empty). Single worker
+# sidesteps this and is plenty for a PoC.
+API_WORKERS=1
+
+LOGFILE=$DEST/logs/stack.sh.log
+LOGDAYS=1
