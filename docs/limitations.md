@@ -19,26 +19,25 @@ and why.
 
 ---
 
-## 1. IPv6
+## 1. IPv6 data path
 
-**Not implemented.** The PoC is IPv4-only. Every code path that touches
-addresses assumes IPv4:
+**Model + API: done. Data path: IPv4-only.** The registry already
+accepts and stores IPv6 VIPs — `local_ipv6` is a real column on
+`local_services` (`neutron_local_services/db/models.py`), the API
+validates and round-trips it (`db/local_services_db.py`), and a
+service can be created with either family or both. What's not wired
+up is the chassis-side realization:
 
-- `local_service.local_ipv4` is the sole VIP field on the model
-  (`neutron_local_services/db/models.py`); there is no `local_ipv6`
-  column.
 - The DHCP host_routes injector (`neutron_local_services/host_routes.py`)
   writes IPv4 classless static routes (DHCP option 121) and skips IPv6
   subnets entirely.
 - The agent extension's tap reconciler (`neutron_local_services/agent/netns.py`)
   layers `inet`-only `/32`s onto the localport veth.
 - Both exposure plugins render IPv4-only listeners (LVS
-  `virtual_server`, Envoy `socket_address.ipv4_only`).
+  `virtual_server`; the proxy catalog only emits v4 entries).
 
 **What productization needs:**
 
-- Add `local_ipv6` column + API field; allow either or both per
-  service.
 - Inject equivalent IPv6 routes via DHCPv6 option 22 or RA Route
   Information Option (RFC 4191). Neutron's RA stack is the integration
   point — same shape as the IPv4 host_routes path but a different
@@ -242,50 +241,40 @@ health-check probe.
 This is a deliberate choice (no Python HC daemon — HC fidelity belongs
 to the plugin that owns the data path), not a deferral. The HC story is
 complete for the PoC; what's missing is **surfacing** HC state through
-the API. `LVSPlugin.get_backend_health` is a stub; the productization
-target is to parse `/proc/net/ip_vs` for LVS and the `/clusters`
-admin endpoint for envoy and expose the result on
+the API. `NatPlugin.get_backend_health` inherits the base `'unknown'`
+stub; `ProxyPlugin.get_backend_health` already scrapes the worker's
+admin endpoint but the result isn't plumbed into the registry response.
+The productization target is to parse `/proc/net/ip_vs` for the `nat`
+plugin and the proxy worker's Envoy-shape `/clusters` JSON for the
+`proxy` plugin, then expose the result on
 `GET /v2.0/local_service_backends/<id>` as a `health_status` field.
 
 ## 8. Octavia coexistence
 
-**Refused at startup.** `LocalServicesPlugin.initialize()` checks
+**Refused at startup.** `LocalServicesPlugin.__init__` checks
 `cfg.CONF.service_providers.service_provider` for the
-`ovn_octavia_provider` substring and raises SystemExit if found. The
-two cannot run side-by-side on the same Neutron because they both
-own the `ovn-lb-hm:distributed` device_owner.
+`ovn_octavia_provider` substring and raises `OctaviaConflictError`
+if found (with a duplicate guard in `initialize()` to cover code
+paths that bypass `__init__`). The two cannot run side-by-side on
+the same Neutron because they both own the `ovn-lb-hm:distributed`
+device_owner.
 
 **What productization needs:** a productization-time refactor to use a
 distinct device_owner (e.g. `ovn-localsvc:localport`) and stop
 piggybacking on the LB-HM port shape. Until then, operators must
 choose one or the other.
 
-## 9. Stateful failover / HA of the netns components
+## 9. Backend rate limiting / L7 features
 
-**None.** Each chassis runs its own keepalived + tenant envoy +
-shared-host envoy. There is no VRRP across chassis, no state
-synchronization between LVS directors, no envoy hot-restart
-coordination across hosts. If the chassis goes down, every service
-on that chassis's tenant netns goes with it; OVN scheduling will
-re-realize the localport on the next-bound chassis and the agent
-will provision fresh.
+**Not implemented.** Both plugins are strictly L4. The `nat` plugin
+forwards via kernel `ip_vs`; the `proxy` plugin runs `splice`-style
+bidirectional copy on accepted TCP connections and a per-tenant UDP
+session table. There is no path-based routing, no header manipulation,
+no rate limiting, no JWT auth — just L4 forwarding with active health
+checks. A future L7 plugin would be a separate exposure plugin
+alongside `nat` and `proxy` rather than a refactor of either.
 
-For the PoC this is fine — the failure unit is "the chassis," and
-chassis failure already takes the tenant VM down. A productization
-effort would only need cross-chassis HA if the localport survived
-chassis failure, which OVN doesn't currently support for
-`type=localport`.
-
-## 10. Backend rate limiting / L7 features
-
-**Not implemented.** The Envoy plugin renders TCP-proxy listeners,
-not HCM listeners with route_config. There is no path-based routing,
-no header manipulation, no rate limiting, no JWT auth — just L4
-proxy with active health checks. The two-tier socket layout is the
-foundation a future L7 plugin would build on, but the PoC stops at
-L4.
-
-## 11. Service groups, router scoping, and other v2 ideas
+## 10. Service groups, router scoping, and other v2 ideas
 
 Per `README.md#out-of-scope`:
 
@@ -307,15 +296,13 @@ roadmap items rather than deliberate constraints.
 
 | Area                            | Status in PoC               | Productization lift         |
 | ------------------------------- | --------------------------- | --------------------------- |
-| IPv6                            | not implemented             | medium (additive)           |
+| IPv6 data path                  | model + API done; chassis-side v4-only | medium (DHCPv6/RA + plugin v6) |
 | Availability zones              | not implemented             | small (additive filter)     |
 | RBAC                            | admin-mutate / read-anyone  | large (RBAC table + checks) |
 | Underlay backends (nat plugin)  | works via per-tenant `nlsu` veth + per-backend ACL | small (tighter ACL options) |
 | Underlay backends (proxy plugin)| works (worker in host netns)| n/a                         |
-| UDP via Envoy                   | skip + warn; use LVS        | large (external terminator) |
 | Multi-chassis (verified)        | 5-node lab; tests green     | n/a                         |
 | Health-check API surface        | plugin-internal only        | small (parse + expose)      |
 | Octavia coexistence             | mutually exclusive          | medium (device_owner split) |
-| Cross-chassis HA                | none (per-chassis only)     | large (needs OVN changes)   |
-| L7 / rate limiting              | none                        | medium (HCM listener + route) |
+| L7 / rate limiting              | none                        | medium (new L7 plugin)      |
 | Service groups / router scoping | not implemented             | medium (model + API)        |
