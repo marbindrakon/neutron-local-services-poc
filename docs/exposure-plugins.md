@@ -141,7 +141,7 @@ simplification — see `docs/limitations.md`).
 Per-service:
 
 ```bash
-openstack network local-service create internal-dns \
+openstack local-service create internal-dns \
     --local-ipv4 169.254.10.53 \
     --port 53 --protocol udp \
     --exposure-plugin nat \

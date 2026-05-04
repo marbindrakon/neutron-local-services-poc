@@ -8,3 +8,5 @@ oslo.log>=4.6.0
 oslo.policy>=3.10.0
 oslo.serialization>=4.2.0
 oslo.utils>=4.10.0
+osc-lib>=2.6.0
+python-openstackclient>=6.0.0
