@@ -14,6 +14,7 @@ from neutron_lib.callbacks import events
 from oslo_config import cfg
 from oslo_config import fixture as config_fixture
 
+from neutron_local_services import constants as lsc
 from neutron_local_services import host_routes as hr
 from neutron_local_services.ovn import localport as lp
 from neutron_local_services.plugin import plugin as plugin_mod
@@ -181,6 +182,8 @@ class TestHostRoutesHandler(testtools.TestCase):
             {'id': 'b1', 'service_id': 'svc', 'network_id': NET_ID,
              'enabled': True}]
         self.plugin.get_local_service.return_value = _service()
+        # No opt-out services by default — mock the list query.
+        self.plugin.get_local_services.return_value = []
         self.find_port_patch = mock.patch.object(
             lp, 'find_port', return_value=_our_port())
         self.find_port_mock = self.find_port_patch.start()
@@ -276,6 +279,13 @@ class TestPluginRefreshSubnetRoutes(testtools.TestCase):
                 group='service_providers')
         except cfg.DuplicateOptError:
             pass
+        # Stop the periodic reconciler from actually starting; we don't
+        # want a stray greenthread and the test only exercises the
+        # synchronous helpers.
+        self.reconciler_patch = mock.patch.object(
+            plugin_mod.LocalServicesPlugin, '_start_reconciler')
+        self.reconciler_patch.start()
+        self.addCleanup(self.reconciler_patch.stop)
         self.plugin = plugin_mod.LocalServicesPlugin()
         self.core = mock.Mock()
         self.plugin._core_plugin_ref = self.core
@@ -285,6 +295,8 @@ class TestPluginRefreshSubnetRoutes(testtools.TestCase):
             {'id': 'b1', 'service_id': 'svc', 'network_id': NET_ID,
              'enabled': True}])
         self.plugin.get_local_service = mock.Mock(return_value=_service())
+        # No opt-out services by default.
+        self.plugin.get_local_services = mock.Mock(return_value=[])
         self.find_port_patch = mock.patch.object(
             lp, 'find_port', return_value=_our_port())
         self.find_port_mock = self.find_port_patch.start()
@@ -347,3 +359,295 @@ class TestPluginRefreshSubnetRoutes(testtools.TestCase):
         # recover).
         self.plugin._refresh_subnet_routes(ctx, NET_ID)
         self.assertEqual(1, self.core.update_subnet.call_count)
+
+
+def _opt_in_svc(sid='svc-in', vip='169.254.1.1'):
+    return {'id': sid, 'local_ipv4': vip, 'enabled': True,
+            'attachment_policy': lsc.ATTACH_OPT_IN}
+
+
+def _opt_out_svc(sid='svc-out', vip='169.254.2.2', enabled=True):
+    return {'id': sid, 'local_ipv4': vip, 'enabled': enabled,
+            'attachment_policy': lsc.ATTACH_OPT_OUT}
+
+
+class TestEffectiveAttachment(testtools.TestCase):
+    """``_enabled_services_for_network`` — the new opt-in/opt-out
+    decision function.
+
+    Covers the full effective-attachment table from
+    ``docs/architecture/overview.md``: opt-in needs an enabled binding,
+    opt-out is implicit unless an ``enabled=False`` marker excludes it,
+    and ``service.enabled=False`` always wins."""
+
+    def setUp(self):
+        super().setUp()
+        self.plugin = mock.Mock()
+        # Default: no bindings, no services. Tests override per case.
+        self.plugin.get_local_service_bindings.return_value = []
+        self.plugin.get_local_services.return_value = []
+
+        def _fake_get(_ctx, sid):
+            for svc in (self._service_table or {}).values():
+                if svc['id'] == sid:
+                    return svc
+            raise KeyError(sid)
+
+        self._service_table = {}
+        self.plugin.get_local_service.side_effect = _fake_get
+
+    def _set_services(self, *services):
+        """Populate the service catalog. Opt-out services are also
+        returned by ``get_local_services(filters={'attachment_policy':
+        ['opt-out'], 'enabled': [True]})`` to mirror server behavior."""
+        self._service_table = {s['id']: s for s in services}
+        self.plugin.get_local_services.return_value = [
+            s for s in services
+            if s.get('attachment_policy') == lsc.ATTACH_OPT_OUT
+            and s.get('enabled', True)]
+
+    def _set_bindings(self, *bindings):
+        self.plugin.get_local_service_bindings.return_value = list(bindings)
+
+    def _binding(self, service_id, enabled=True):
+        return {'id': 'b-' + service_id, 'service_id': service_id,
+                'network_id': NET_ID, 'enabled': enabled}
+
+    # opt-in cases ---------------------------------------------------
+    def test_opt_in_no_binding_not_effective(self):
+        self._set_services(_opt_in_svc())
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([], result)
+
+    def test_opt_in_with_enabled_binding_is_effective(self):
+        svc = _opt_in_svc()
+        self._set_services(svc)
+        self._set_bindings(self._binding(svc['id'], enabled=True))
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([svc['id']], [s['id'] for s in result])
+
+    def test_opt_in_with_disabled_binding_not_effective(self):
+        svc = _opt_in_svc()
+        self._set_services(svc)
+        self._set_bindings(self._binding(svc['id'], enabled=False))
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([], result)
+
+    # opt-out cases --------------------------------------------------
+    def test_opt_out_no_binding_is_effective(self):
+        # The headline case: opt-out service auto-attaches.
+        svc = _opt_out_svc()
+        self._set_services(svc)
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([svc['id']], [s['id'] for s in result])
+
+    def test_opt_out_with_disabled_binding_is_excluded(self):
+        # The tenant has explicitly opted out by creating an
+        # ``enabled=False`` binding.
+        svc = _opt_out_svc()
+        self._set_services(svc)
+        self._set_bindings(self._binding(svc['id'], enabled=False))
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([], result)
+
+    def test_opt_out_with_enabled_binding_is_effective_no_dup(self):
+        # An ``enabled=True`` binding for an opt-out service is a
+        # redundant but legal write — it shouldn't double-count.
+        svc = _opt_out_svc()
+        self._set_services(svc)
+        self._set_bindings(self._binding(svc['id'], enabled=True))
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([svc['id']], [s['id'] for s in result])
+
+    def test_disabled_opt_out_service_not_effective(self):
+        # ``service.enabled=False`` overrides the implicit attachment.
+        # The mock filters it out at the catalog query, just like the DB.
+        svc = _opt_out_svc(enabled=False)
+        self._set_services(svc)
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual([], result)
+
+    # mixed --------------------------------------------------------
+    def test_mixed_opt_in_and_opt_out(self):
+        # An opt-in service with a binding alongside an unrelated
+        # opt-out service: both are effective.
+        in_svc = _opt_in_svc(sid='svc-in', vip='169.254.10.1')
+        out_svc = _opt_out_svc(sid='svc-out', vip='169.254.10.2')
+        self._set_services(in_svc, out_svc)
+        self._set_bindings(self._binding(in_svc['id'], enabled=True))
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual({in_svc['id'], out_svc['id']},
+                         {s['id'] for s in result})
+
+    def test_disabled_binding_for_other_service_doesnt_exclude_opt_out(self):
+        # Network has an ``enabled=False`` row for service A (some opt-in
+        # in placeholder state) but service B is opt-out — B is still
+        # effective.
+        in_svc = _opt_in_svc(sid='svc-a')
+        out_svc = _opt_out_svc(sid='svc-b')
+        self._set_services(in_svc, out_svc)
+        self._set_bindings(self._binding(in_svc['id'], enabled=False))
+        result = hr._enabled_services_for_network(
+            self.plugin, mock.Mock(), NET_ID)
+        self.assertEqual({out_svc['id']}, {s['id'] for s in result})
+
+
+class TestPluginReconcileNetwork(testtools.TestCase):
+    """``_reconcile_network`` — the canonical state-driver invoked by
+    binding hooks AND the periodic loop."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg_fixture = self.useFixture(config_fixture.Config(cfg.CONF))
+        try:
+            self.cfg_fixture.register_opt(
+                cfg.ListOpt('service_provider', default=[]),
+                group='service_providers')
+        except cfg.DuplicateOptError:
+            pass
+        # Block the periodic reconciler from starting under test.
+        self.reconciler_patch = mock.patch.object(
+            plugin_mod.LocalServicesPlugin, '_start_reconciler')
+        self.reconciler_patch.start()
+        self.addCleanup(self.reconciler_patch.stop)
+        self.plugin = plugin_mod.LocalServicesPlugin()
+        self.core = mock.Mock()
+        self.plugin._core_plugin_ref = self.core
+        self.plugin._mech_driver_ref = self.plugin._MECH_DRIVER_UNAVAILABLE
+        # Default no bindings, no services, one IPv4 subnet on the net.
+        self.plugin.get_local_service_bindings = mock.Mock(return_value=[])
+        self.plugin.get_local_service = mock.Mock(return_value=None)
+        self.plugin.get_local_services = mock.Mock(return_value=[])
+        self.core.get_subnets.return_value = [_subnet(host_routes=[])]
+        self.core.get_network.return_value = {
+            'id': NET_ID, 'project_id': 'tenant-1'}
+        self.find_port_patch = mock.patch.object(
+            lp, 'find_port', return_value=_our_port())
+        self.find_port_mock = self.find_port_patch.start()
+        self.addCleanup(self.find_port_patch.stop)
+        self.ensure_port_patch = mock.patch.object(
+            lp, 'ensure_localport', return_value=_our_port())
+        self.ensure_port_patch.start()
+        self.addCleanup(self.ensure_port_patch.stop)
+        self.maybe_remove_patch = mock.patch.object(
+            lp, 'maybe_remove_localport', return_value=False)
+        self.maybe_remove_mock = self.maybe_remove_patch.start()
+        self.addCleanup(self.maybe_remove_patch.stop)
+
+    def test_opt_out_service_creates_localport_on_fresh_network(self):
+        # No bindings, but an opt-out service exists → reconcile ensures
+        # the localport and injects routes.
+        out_svc = _opt_out_svc(sid='svc-out', vip='169.254.99.1')
+        self.plugin.get_local_services.return_value = [out_svc]
+        self.plugin._reconcile_network(mock.Mock(), NET_ID)
+        # ensure_localport was called (via _ensure_localport).
+        from neutron_local_services.ovn import localport as lpmod
+        lpmod.ensure_localport.assert_called_once()
+        # update_subnet was called to inject the VIP route.
+        self.core.update_subnet.assert_called_once()
+        body = self.core.update_subnet.call_args.args[2]
+        self.assertEqual(
+            [{'destination': '169.254.99.1/32', 'nexthop': '10.0.0.7'}],
+            body['subnet']['host_routes'])
+
+    def test_opt_out_marker_removes_localport_when_alone(self):
+        # Same opt-out service, but this network has the
+        # ``enabled=False`` opt-out marker → reconcile drops the port.
+        out_svc = _opt_out_svc(sid='svc-out', vip='169.254.99.1')
+        self.plugin.get_local_services.return_value = [out_svc]
+        self.plugin.get_local_service_bindings.return_value = [
+            {'id': 'b1', 'service_id': out_svc['id'],
+             'network_id': NET_ID, 'enabled': False}]
+        self.plugin._reconcile_network(mock.Mock(), NET_ID)
+        self.maybe_remove_mock.assert_called_once()
+        # has_remaining_bindings is False because the only attachment
+        # was excluded by the opt-out marker.
+        kwargs = self.maybe_remove_mock.call_args.kwargs
+        self.assertFalse(kwargs['has_remaining_bindings'])
+
+    def test_opt_out_marker_keeps_localport_when_other_service_attached(self):
+        # Opt-out service excluded on this network, but an opt-in
+        # service is bound → localport stays.
+        out_svc = _opt_out_svc(sid='svc-out', vip='169.254.99.1')
+        in_svc = _opt_in_svc(sid='svc-in', vip='169.254.10.1')
+        self.plugin.get_local_services.return_value = [out_svc]
+        self.plugin.get_local_service.return_value = in_svc
+        self.plugin.get_local_service_bindings.return_value = [
+            {'id': 'b-out', 'service_id': out_svc['id'],
+             'network_id': NET_ID, 'enabled': False},
+            {'id': 'b-in', 'service_id': in_svc['id'],
+             'network_id': NET_ID, 'enabled': True},
+        ]
+        self.plugin._reconcile_network(mock.Mock(), NET_ID)
+        # _ensure_localport runs; _maybe_remove does NOT.
+        from neutron_local_services.ovn import localport as lpmod
+        lpmod.ensure_localport.assert_called_once()
+        self.maybe_remove_mock.assert_not_called()
+
+
+class TestPluginReconcileLoop(testtools.TestCase):
+    """``_reconcile_loop`` — the periodic timer body. Walks every
+    network, isolates failures, swallows the listing error."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg_fixture = self.useFixture(config_fixture.Config(cfg.CONF))
+        try:
+            self.cfg_fixture.register_opt(
+                cfg.ListOpt('service_provider', default=[]),
+                group='service_providers')
+        except cfg.DuplicateOptError:
+            pass
+        self.reconciler_patch = mock.patch.object(
+            plugin_mod.LocalServicesPlugin, '_start_reconciler')
+        self.reconciler_patch.start()
+        self.addCleanup(self.reconciler_patch.stop)
+        # n_context.get_admin_context() reaches into oslo.policy which
+        # tries to load policy files — not available in unit tests.
+        # Stub it out with a lightweight mock context.
+        self.ctx_patch = mock.patch.object(
+            plugin_mod.n_context, 'get_admin_context',
+            return_value=mock.Mock())
+        self.ctx_patch.start()
+        self.addCleanup(self.ctx_patch.stop)
+        self.plugin = plugin_mod.LocalServicesPlugin()
+        self.core = mock.Mock()
+        self.plugin._core_plugin_ref = self.core
+        # Patch the per-network reconcile so we just count calls.
+        self.reconcile_net_patch = mock.patch.object(
+            self.plugin, '_reconcile_network')
+        self.reconcile_net_mock = self.reconcile_net_patch.start()
+        self.addCleanup(self.reconcile_net_patch.stop)
+
+    def test_walks_every_network(self):
+        self.core.get_networks.return_value = [
+            {'id': 'net-a'}, {'id': 'net-b'}, {'id': 'net-c'}]
+        self.plugin._reconcile_loop()
+        ids = [c.args[1] for c in self.reconcile_net_mock.call_args_list]
+        self.assertEqual(['net-a', 'net-b', 'net-c'], ids)
+
+    def test_one_failing_network_does_not_block_others(self):
+        self.core.get_networks.return_value = [
+            {'id': 'net-a'}, {'id': 'net-b'}, {'id': 'net-c'}]
+        # net-b raises; net-a and net-c should still see reconcile calls.
+        def _maybe_raise(_ctx, net_id):
+            if net_id == 'net-b':
+                raise RuntimeError('boom')
+        self.reconcile_net_mock.side_effect = _maybe_raise
+        self.plugin._reconcile_loop()
+        ids = [c.args[1] for c in self.reconcile_net_mock.call_args_list]
+        self.assertEqual(['net-a', 'net-b', 'net-c'], ids)
+
+    def test_get_networks_failure_skips_pass_cleanly(self):
+        self.core.get_networks.side_effect = RuntimeError('db down')
+        # Should not raise — periodic timer resumes on the next tick.
+        self.plugin._reconcile_loop()
+        self.reconcile_net_mock.assert_not_called()

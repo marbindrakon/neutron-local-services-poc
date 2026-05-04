@@ -30,6 +30,7 @@ from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
 from oslo_log import log as logging
 
+from neutron_local_services import constants as lsc
 from neutron_local_services.ovn import localport as lp
 
 
@@ -223,24 +224,60 @@ class HostRoutesHandler:
 
 
 def _enabled_services_for_network(plugin, context, network_id):
-    """Return enabled services with an enabled binding to ``network_id``.
+    """Return services effectively attached to ``network_id``.
 
-    Both the binding and the service must be ``enabled=True`` to count
-    — disabling either is a tenant- or operator-initiated way to
-    suppress route injection without dropping the binding.
+    A service is attached when:
+
+    * ``service.enabled=True`` AND
+    * Either:
+        - ``attachment_policy='opt-in'`` and a binding row exists with
+          ``enabled=True`` (explicit opt-in); or
+        - ``attachment_policy='opt-out'`` and no binding row exists with
+          ``enabled=False`` (implicit attachment, exclusion via the
+          ``enabled=False`` opt-out marker).
+
+    A redundant ``enabled=True`` binding for an opt-out service is a
+    no-op: the service is already implicitly attached.
     """
+    # Fetch ALL bindings for this network (both enabled and disabled). We
+    # need both states: enabled rows are inclusions for opt-in services,
+    # disabled rows are exclusions for opt-out services.
     bindings = plugin.get_local_service_bindings(
-        context, filters={'network_id': [network_id], 'enabled': [True]})
+        context, filters={'network_id': [network_id]})
+    enabled_svc_ids = {
+        b['service_id'] for b in bindings if b.get('enabled', True)}
+    excluded_svc_ids = {
+        b['service_id'] for b in bindings if not b.get('enabled', True)}
+
     services = []
-    for b in bindings:
+    seen = set()
+
+    # Explicit attachments via enabled bindings. Covers opt-in services
+    # the tenant has opted into and the (redundant) case of an opt-out
+    # service with an enabled binding.
+    for sid in enabled_svc_ids:
         try:
-            svc = plugin.get_local_service(context, b['service_id'])
+            svc = plugin.get_local_service(context, sid)
         except Exception:
             LOG.exception(
-                'Failed to fetch service %s for binding %s while '
-                'computing host_routes; skipping',
-                b.get('service_id'), b.get('id'))
+                'Failed to fetch service %s while computing host_routes '
+                'for network %s; skipping', sid, network_id)
             continue
-        if svc.get('enabled', True):
+        if svc.get('enabled', True) and sid not in seen:
             services.append(svc)
+            seen.add(sid)
+
+    # Implicit attachments: every enabled opt-out service applies to
+    # this network unless it's been explicitly excluded.
+    opt_out = plugin.get_local_services(
+        context,
+        filters={'attachment_policy': [lsc.ATTACH_OPT_OUT],
+                 'enabled': [True]})
+    for svc in opt_out:
+        sid = svc['id']
+        if sid in excluded_svc_ids or sid in seen:
+            continue
+        services.append(svc)
+        seen.add(sid)
+
     return services

@@ -10,10 +10,12 @@ Wires together:
   create/update (via `neutron_local_services.host_routes`).
 """
 
+from neutron_lib import context as n_context
 from neutron_lib import exceptions as n_exc
 from neutron_lib.plugins import directory
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_service import loopingcall
 
 from neutron_local_services import conf as ls_conf
 from neutron_local_services import constants as lsc
@@ -65,6 +67,11 @@ class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
         # them. Constructed once per plugin instance.
         self._host_routes_handler = hr.HostRoutesHandler(self)
         self._host_routes_handler.register()
+        # Periodic reconciler: drives opt-out service fan-out across all
+        # networks and recovers from any drift in localport / host_route
+        # state. See ``_reconcile_loop`` for cadence + rationale.
+        self._reconcile_thread = None
+        self._start_reconciler()
 
     def initialize(self):
         """Compatibility hook for the unit-test path.
@@ -123,6 +130,89 @@ class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
             return None
         return self._mech_driver_ref
 
+    # ----- reconciler -----
+
+    def _start_reconciler(self):
+        """Kick off the periodic reconciliation loop.
+
+        Best-effort: failure to start the loop (oslo.service unavailable
+        in unit-test contexts, etc.) is logged but doesn't block plugin
+        load. Steady-state correctness is also reachable from the
+        binding hooks; the loop's job is to fan out opt-out services
+        across networks that don't have explicit bindings.
+        """
+        try:
+            interval = cfg.CONF[ls_conf.GROUP].plugin_reconciler_interval
+        except cfg.NoSuchOptError:
+            LOG.debug('plugin_reconciler_interval not registered; '
+                      'reconciler not started (test context?)')
+            return
+        try:
+            self._reconcile_thread = loopingcall.FixedIntervalLoopingCall(
+                self._reconcile_loop)
+            # initial_delay lets neutron-server finish wiring core plugin
+            # + mech drivers before we start poking networks.
+            self._reconcile_thread.start(
+                interval=interval, initial_delay=interval)
+            LOG.info('Started local-services plugin reconciler '
+                     '(interval=%ss)', interval)
+        except Exception:
+            LOG.exception('Failed to start local-services plugin '
+                          'reconciler — opt-out fan-out will not '
+                          'happen until the next plugin restart')
+            self._reconcile_thread = None
+
+    def _reconcile_loop(self):
+        """One reconciliation pass: walk every network, reconcile each.
+
+        Errors per-network are caught and logged so one bad network
+        doesn't poison the whole pass. Runs in an admin context so it
+        can see every network regardless of project scoping.
+        """
+        ctx = n_context.get_admin_context()
+        try:
+            networks = self._core_plugin.get_networks(ctx)
+        except Exception:
+            LOG.exception('Plugin reconciler failed to list networks; '
+                          'skipping this pass')
+            return
+        for net in networks:
+            net_id = net.get('id')
+            if not net_id:
+                continue
+            try:
+                self._reconcile_network(ctx, net_id)
+            except Exception:
+                LOG.exception(
+                    'Plugin reconciler: failed to reconcile network %s; '
+                    'continuing with the rest', net_id)
+
+    def _reconcile_network(self, context, network_id):
+        """Bring the chassis-side state for ``network_id`` into line with
+        the effective service set.
+
+        * If any service is effectively attached: ensure the localport
+          exists and refresh per-subnet host_routes.
+        * If no services are effectively attached: refresh routes (so
+          stale entries get cleaned up) and remove the localport iff no
+          binding rows remain on the network.
+
+        Idempotent. Safe to call from binding hooks AND the periodic
+        loop. Raises only when ``_ensure_localport`` raises (LSP type
+        verification failure); other steps catch their own errors.
+        """
+        services = hr._enabled_services_for_network(
+            self, context, network_id)
+        if services:
+            self._ensure_localport(context, network_id)
+            self._refresh_subnet_routes(context, network_id)
+        else:
+            # No effective services. Refresh first so any stale routes
+            # we previously injected get scrubbed, THEN drop the
+            # localport if nothing else holds it.
+            self._refresh_subnet_routes(context, network_id)
+            self._maybe_remove_localport(context, network_id)
+
     # ----- localport lifecycle -----
 
     def _ensure_localport(self, context, network_id):
@@ -146,12 +236,19 @@ class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
         return port
 
     def _maybe_remove_localport(self, context, network_id):
-        """Drop our localport if no bindings remain on the network."""
-        remaining = self.get_local_service_bindings(
-            context, filters={'network_id': [network_id]})
+        """Drop our localport if nothing is effectively attached.
+
+        Caller (``_reconcile_network``) has already determined that the
+        effective service set is empty before invoking this — we don't
+        re-check, but we DO double-check that no bindings or opt-out
+        services would still imply attachment, as a guard against
+        races between the binding write path and concurrent updates.
+        """
+        services = hr._enabled_services_for_network(
+            self, context, network_id)
         lp.maybe_remove_localport(
             self._core_plugin, context, network_id,
-            has_remaining_bindings=bool(remaining))
+            has_remaining_bindings=bool(services))
 
     # ----- host_routes refresh -----
 
@@ -206,24 +303,44 @@ class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
         result = super().create_local_service_binding(
             context, local_service_binding)
         try:
-            self._ensure_localport(context, result['network_id'])
+            self._reconcile_network(context, result['network_id'])
         except Exception:
             # Roll back the binding so the caller doesn't end up with a
-            # binding that has no port on the data plane.
+            # binding that points at a half-provisioned data plane.
             LOG.exception(
-                'Failed to ensure localport for binding %s on network %s; '
-                'rolling back the binding',
-                result['id'], result['network_id'])
+                'Failed to reconcile network %s after creating binding '
+                '%s; rolling back the binding',
+                result['network_id'], result['id'])
             try:
                 super().delete_local_service_binding(context, result['id'])
             except Exception:
                 LOG.exception('Failed to roll back binding %s', result['id'])
             raise
-        self._refresh_subnet_routes(context, result['network_id'])
+        return result
+
+    def update_local_service_binding(self, context, id_,
+                                     local_service_binding):
+        result = super().update_local_service_binding(
+            context, id_, local_service_binding)
+        # ``enabled`` may have flipped — reconcile so opt-out markers
+        # take effect (or get cleared) without waiting for the periodic
+        # loop. Failures are logged; the loop will recover.
+        try:
+            self._reconcile_network(context, result['network_id'])
+        except Exception:
+            LOG.exception(
+                'Failed to reconcile network %s after updating binding '
+                '%s; periodic reconciler will recover',
+                result['network_id'], id_)
         return result
 
     def delete_local_service_binding(self, context, id_):
         binding = self.get_local_service_binding(context, id_)
         super().delete_local_service_binding(context, id_)
-        self._refresh_subnet_routes(context, binding['network_id'])
-        self._maybe_remove_localport(context, binding['network_id'])
+        try:
+            self._reconcile_network(context, binding['network_id'])
+        except Exception:
+            LOG.exception(
+                'Failed to reconcile network %s after deleting binding '
+                '%s; periodic reconciler will recover',
+                binding['network_id'], id_)

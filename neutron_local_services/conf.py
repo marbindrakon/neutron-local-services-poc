@@ -33,6 +33,19 @@ OPTS = [
         min=1,
         help='Seconds between agent-side reconciliation passes.',
     ),
+    cfg.IntOpt(
+        'plugin_reconciler_interval',
+        default=60,
+        min=10,
+        help='Seconds between plugin-side reconciliation passes. The '
+             'plugin walks every Neutron network on each tick to drive '
+             'opt-out service fan-out (creating/removing localports and '
+             'refreshing host_routes). Heavier than the agent loop, so '
+             'the default is more conservative. Sets the upper-bound '
+             'latency between an opt-out service create/update and the '
+             'service appearing on a network without an explicit '
+             'binding.',
+    ),
     cfg.BoolOpt(
         'allow_az_global_fallback',
         default=False,

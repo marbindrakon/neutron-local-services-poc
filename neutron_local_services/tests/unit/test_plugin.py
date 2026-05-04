@@ -26,6 +26,13 @@ class TestOctaviaGuard(testtools.TestCase):
                 group='service_providers')
         except cfg.DuplicateOptError:
             pass
+        # The plugin starts a periodic reconciler in __init__; tests
+        # don't want the greenthread, so patch it out for the whole
+        # test class.
+        self.reconciler_patch = mock.patch.object(
+            plugin.LocalServicesPlugin, '_start_reconciler')
+        self.reconciler_patch.start()
+        self.addCleanup(self.reconciler_patch.stop)
 
     def test_no_octavia_initialize_succeeds(self):
         p = plugin.LocalServicesPlugin()

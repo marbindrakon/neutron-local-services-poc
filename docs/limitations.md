@@ -93,6 +93,9 @@ What this means in practice:
 - A binding scopes a service to a network, but there is no check
   that the network's project is allowed to consume that service —
   any admin can bind any service to any network.
+- The opt-in/opt-out **mechanism** is implemented (see §11), but the
+  RBAC story for who is allowed to opt in or opt out is not — any
+  admin can create or delete any binding row.
 
 **What productization needs:**
 
@@ -106,6 +109,9 @@ What this means in practice:
 - A "consumer" project distinct from the "owner" project so a tenant
   can opt their network in to a shared service without granting
   mutate rights.
+- Per-policy authorization for opt-in / opt-out actions so a tenant
+  can opt their own network in to a shared opt-in service or out of
+  an opt-out service without admin involvement.
 - Audit logs for binding mutations so the operator can answer
   "who bound what where, and when" without grepping API logs.
 
@@ -290,6 +296,46 @@ Per `README.md#out-of-scope`:
 These are tracked in the README, not here, because they are open
 roadmap items rather than deliberate constraints.
 
+## 11. Opt-in / opt-out attachment
+
+**Implemented.** The `attachment_policy` field on `local_services` is
+honored end-to-end:
+
+- **opt-in**: a service applies to a network only if a
+  `local_service_binding` row exists with `enabled=true`.
+- **opt-out**: a service applies to every Neutron network unless a
+  `local_service_binding` row exists for that (service, network) pair
+  with `enabled=false` — the row is the opt-out marker.
+
+Fan-out for opt-out services is driven by a periodic reconciler in the
+service plugin (`[local_services] plugin_reconciler_interval`, default
+60s) that walks every Neutron network and brings localport state
+in line with the effective service set. The same per-network reconcile
+routine runs synchronously on every binding create/update/delete so
+explicit changes apply immediately.
+
+**Latency window:** an admin creating a new opt-out service waits up to
+`plugin_reconciler_interval` seconds before the service appears on
+networks that didn't already have a localport. Creating a new network
+has the same latency window before opt-out services attach. Operators
+can lower the interval (minimum 10s) for lab work or raise it for
+large clouds.
+
+**Scope:** cloud-wide. Every Neutron network sees every enabled
+opt-out service. Project-scoped opt-out (only this project's networks)
+is not implemented and would require RBAC depth not yet present (see
+§3 above).
+
+**What productization could still tighten:**
+
+- A fan-out trigger keyed on Neutron NETWORK / SUBNET `AFTER_CREATE`
+  events, eliminating the reconciler latency window for new networks
+  without removing the periodic-reconciler safety net.
+- Project-scoped opt-out (paired with §3 RBAC work).
+- Distinguishing "haven't decided yet" from "explicitly opted out" for
+  opt-in services — today both are represented as the absence of an
+  enabled binding row.
+
 ---
 
 ## Summary table
@@ -306,3 +352,4 @@ roadmap items rather than deliberate constraints.
 | Octavia coexistence             | mutually exclusive          | medium (device_owner split) |
 | L7 / rate limiting              | none                        | medium (new L7 plugin)      |
 | Service groups / router scoping | not implemented             | medium (model + API)        |
+| Opt-in / opt-out attachment     | implemented (cloud-wide)    | small (event-driven fan-out, RBAC depth) |

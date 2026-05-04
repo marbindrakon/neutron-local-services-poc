@@ -123,45 +123,84 @@ class RegistryClient:
                 if svc.get('local_ipv4')}
 
     def desired_state_for_network(self, network_id):
-        """Return the list of service dicts scoped to ``network_id``.
+        """Return the list of service dicts effectively attached to
+        ``network_id``.
 
         Each service dict carries the full row from
         ``GET /v2.0/local_services/<id>`` plus a ``backends`` list of
         the service's enabled backends from
         ``GET /v2.0/local_service_backends?service_id=...&enabled=True``.
 
-        Disabled services are filtered out — the operator quiesced them
-        and we shouldn't render config for them. Disabled bindings are
-        filtered out at the bindings query (``?enabled=True``); the
-        client-side ``b.get('enabled', True)`` belt-and-braces survives
-        an older server / mock.
+        Effective attachment mirrors the server-side rule (see
+        ``host_routes._enabled_services_for_network``):
 
+        * Explicit attachment: an ``enabled=True`` binding row exists
+          for the (service, network) pair.
+        * Implicit attachment: the service has
+          ``attachment_policy='opt-out'`` and ``enabled=True``, and no
+          ``enabled=False`` binding row exists for this network.
+
+        Disabled services are filtered out — the operator quiesced them.
         Returns ``[]`` on any error so the agent reconciler can log and
         move on rather than crash. Per-service errors are partial: the
         services that did fetch successfully still appear in the list.
         """
+        # Fetch ALL bindings for this network. Both states matter: enabled
+        # rows are inclusions; disabled rows are opt-out markers.
         bindings_resp = self._get_json(
-            '/v2.0/local_service_bindings?network_id=%s&enabled=True'
-            % network_id)
-        if not bindings_resp:
-            return []
-        bindings = bindings_resp.get('local_service_bindings') or []
+            '/v2.0/local_service_bindings?network_id=%s' % network_id)
+        bindings = []
+        if bindings_resp:
+            bindings = bindings_resp.get('local_service_bindings') or []
 
-        # De-dup service ids — same reasoning as the vip path.
-        service_ids = {b['service_id'] for b in bindings
-                       if b.get('service_id') and b.get('enabled', True)}
+        enabled_svc_ids = {b['service_id'] for b in bindings
+                           if b.get('service_id')
+                           and b.get('enabled', True)}
+        excluded_svc_ids = {b['service_id'] for b in bindings
+                            if b.get('service_id')
+                            and not b.get('enabled', True)}
 
         services = []
-        for sid in service_ids:
-            svc_resp = self._get_json('/v2.0/local_services/%s' % sid)
-            if not svc_resp:
+        seen = set()
+
+        # Explicit attachments: fetch each by id.
+        for sid in enabled_svc_ids:
+            svc = self._fetch_service(sid)
+            if svc and sid not in seen:
+                services.append(svc)
+                seen.add(sid)
+
+        # Implicit attachments: every enabled opt-out service applies
+        # unless explicitly excluded.
+        opt_out_resp = self._get_json(
+            '/v2.0/local_services'
+            '?attachment_policy=opt-out&enabled=True')
+        opt_out = []
+        if opt_out_resp:
+            opt_out = opt_out_resp.get('local_services') or []
+        for svc in opt_out:
+            sid = svc.get('id')
+            if not sid or sid in seen or sid in excluded_svc_ids:
                 continue
-            svc = svc_resp.get('local_service') or {}
             if not svc.get('enabled', True):
                 continue
             svc['backends'] = self._fetch_backends(sid)
             services.append(svc)
+            seen.add(sid)
+
         return services
+
+    def _fetch_service(self, service_id):
+        """Fetch a single service + its enabled backends. None on error
+        or if the service is operator-disabled."""
+        svc_resp = self._get_json('/v2.0/local_services/%s' % service_id)
+        if not svc_resp:
+            return None
+        svc = svc_resp.get('local_service') or {}
+        if not svc.get('enabled', True):
+            return None
+        svc['backends'] = self._fetch_backends(service_id)
+        return svc
 
     def _fetch_backends(self, service_id):
         """List enabled backends for one service. Empty list on error."""

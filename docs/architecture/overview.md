@@ -148,6 +148,41 @@ CRUD on these resources uses the standard Neutron RBAC / policy
 machinery. Default policy: admin-only mutate, anyone-read. See
 [the API reference in README.md](../../README.md#api-reference).
 
+#### Effective attachment & opt-in / opt-out
+
+A service is "effectively attached" to a network when it should
+materialize a localport + DHCP host_routes there. The rule is:
+
+- `attachment_policy = opt-in`: effective iff a `local_service_binding`
+  row exists for the (service, network) pair with `enabled=true`.
+- `attachment_policy = opt-out`: effective for every Neutron network
+  unless a `local_service_binding` row exists for the pair with
+  `enabled=false` (the row functions as the opt-out marker).
+- `service.enabled=false` overrides everything — the service is never
+  effective, regardless of binding state.
+
+Both the server-side host_routes injector and the agent-side reconciler
+compute the effective set the same way; the agent reads it via two REST
+calls (the per-network bindings list and a filtered query for enabled
+opt-out services) so no privileged data crosses an extra channel.
+
+#### Plugin reconciler
+
+The service plugin runs a periodic loop
+(`[local_services] plugin_reconciler_interval`, default 60s) that
+walks every Neutron network and brings localport state in line with the
+effective service set. The same per-network reconcile routine
+(`LocalServicesPlugin._reconcile_network`) fires synchronously on every
+binding create/update/delete. Together this gives:
+
+- O(reconcile_interval) latency for opt-out services to attach to a
+  newly-created network or for a newly-created opt-out service to fan
+  out across existing networks.
+- Immediate response to explicit binding writes (no waiting for the
+  next tick).
+- Self-healing: any drift between the binding/service catalog and the
+  on-chassis localport state gets reconciled on the next tick.
+
 ### Localport piggyback
 
 The plugin doesn't introduce a new OVN type. Instead, it creates a

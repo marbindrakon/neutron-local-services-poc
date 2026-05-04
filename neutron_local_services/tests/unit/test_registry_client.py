@@ -372,3 +372,142 @@ class TestDesiredStateForNetwork(testtools.TestCase):
         })
         self.assertEqual({'169.254.99.99/32'},
                          self.client.desired_vips_for_network(NET_ID))
+
+
+class TestDesiredStateOptOut(testtools.TestCase):
+    """Agent-side composition of opt-out semantics.
+
+    The client mirrors the server's effective-attachment rule:
+    every enabled opt-out service applies to every network unless an
+    ``enabled=False`` binding row excludes it.
+
+    URL key discrimination in the mock matcher: the implicit-attachment
+    query lands on ``/local_services?attachment_policy=opt-out&...``
+    while per-service GETs land on ``/local_services/<id>``. The keys
+    below are picked so each call routes to its own response — see the
+    string-substring matcher in ``_set_responses``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client = registry_client.RegistryClient()
+        self.session = mock.Mock()
+        self.session.get_endpoint.return_value = 'http://neutron/networking'
+        self.client._session = self.session
+        self.client._endpoint = 'http://neutron/networking'
+
+    def _set_responses(self, mapping):
+        def _get(url, raise_exc=False):
+            for key, resp in mapping.items():
+                if key in url:
+                    return resp
+            return _Resp(404, {})
+        self.session.get.side_effect = _get
+
+    def test_opt_out_no_binding_appears_in_state(self):
+        # No bindings at all — the opt-out service is implicit on the
+        # network.
+        out_id = 'svc-out'
+        self._set_responses({
+            'local_service_bindings': _Resp(200, {
+                'local_service_bindings': []}),
+            'attachment_policy=opt-out': _Resp(200, {
+                'local_services': [{
+                    'id': out_id, 'enabled': True,
+                    'attachment_policy': 'opt-out',
+                    'local_ipv4': '169.254.55.5'}]}),
+            'local_service_backends': _Resp(200, {
+                'local_service_backends': []}),
+        })
+        services = self.client.desired_state_for_network(NET_ID)
+        self.assertEqual([out_id], [s['id'] for s in services])
+
+    def test_opt_out_marker_excludes_service(self):
+        # ``enabled=False`` binding row functions as the opt-out marker.
+        out_id = 'svc-out'
+        self._set_responses({
+            'local_service_bindings': _Resp(200, {
+                'local_service_bindings': [
+                    {'service_id': out_id, 'network_id': NET_ID,
+                     'enabled': False}]}),
+            'attachment_policy=opt-out': _Resp(200, {
+                'local_services': [{
+                    'id': out_id, 'enabled': True,
+                    'attachment_policy': 'opt-out',
+                    'local_ipv4': '169.254.55.5'}]}),
+        })
+        services = self.client.desired_state_for_network(NET_ID)
+        self.assertEqual([], services)
+
+    def test_redundant_enabled_binding_no_dup(self):
+        # Same service appears in both the explicit fetch (via
+        # enabled-binding) and the implicit opt-out list — should land
+        # in the result exactly once.
+        out_id = 'svc-out'
+        self._set_responses({
+            'local_service_bindings': _Resp(200, {
+                'local_service_bindings': [
+                    {'service_id': out_id, 'network_id': NET_ID,
+                     'enabled': True}]}),
+            '/local_services/' + out_id: _Resp(200, {
+                'local_service': {
+                    'id': out_id, 'enabled': True,
+                    'attachment_policy': 'opt-out',
+                    'local_ipv4': '169.254.55.5'}}),
+            'attachment_policy=opt-out': _Resp(200, {
+                'local_services': [{
+                    'id': out_id, 'enabled': True,
+                    'attachment_policy': 'opt-out',
+                    'local_ipv4': '169.254.55.5'}]}),
+            'local_service_backends': _Resp(200, {
+                'local_service_backends': []}),
+        })
+        services = self.client.desired_state_for_network(NET_ID)
+        self.assertEqual(1, len(services))
+        self.assertEqual(out_id, services[0]['id'])
+
+    def test_mixed_opt_in_and_opt_out_both_in_state(self):
+        in_id, out_id = 'svc-in', 'svc-out'
+        self._set_responses({
+            'local_service_bindings': _Resp(200, {
+                'local_service_bindings': [
+                    {'service_id': in_id, 'network_id': NET_ID,
+                     'enabled': True}]}),
+            '/local_services/' + in_id: _Resp(200, {
+                'local_service': {
+                    'id': in_id, 'enabled': True,
+                    'attachment_policy': 'opt-in',
+                    'local_ipv4': '169.254.10.1'}}),
+            'attachment_policy=opt-out': _Resp(200, {
+                'local_services': [{
+                    'id': out_id, 'enabled': True,
+                    'attachment_policy': 'opt-out',
+                    'local_ipv4': '169.254.20.2'}]}),
+            'local_service_backends': _Resp(200, {
+                'local_service_backends': []}),
+        })
+        services = self.client.desired_state_for_network(NET_ID)
+        self.assertEqual({in_id, out_id}, {s['id'] for s in services})
+
+    def test_opt_out_query_failure_yields_explicit_only(self):
+        # If the catalog query for opt-out services fails, we still
+        # return whatever the explicit-binding path produced. Guards
+        # the agent against a partial-API outage taking the chassis to
+        # a fully-empty state.
+        in_id = 'svc-in'
+        self._set_responses({
+            'local_service_bindings': _Resp(200, {
+                'local_service_bindings': [
+                    {'service_id': in_id, 'network_id': NET_ID,
+                     'enabled': True}]}),
+            '/local_services/' + in_id: _Resp(200, {
+                'local_service': {
+                    'id': in_id, 'enabled': True,
+                    'attachment_policy': 'opt-in',
+                    'local_ipv4': '169.254.10.1'}}),
+            'attachment_policy=opt-out': _Resp(500, 'down'),
+            'local_service_backends': _Resp(200, {
+                'local_service_backends': []}),
+        })
+        services = self.client.desired_state_for_network(NET_ID)
+        self.assertEqual([in_id], [s['id'] for s in services])

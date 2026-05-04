@@ -372,10 +372,38 @@ API Reference
   - Protocol (TCP, UDP, or TCP/UDP)
   - Port
   - Attachment policy
-    - Opt-Out - Attached to tenant networks by default, tenant can opt-out.
-                Opt-out is controlled by RBAC.
-    - Opt-In - Not Attached to tenant networks by default, tenant can opt-in.
-               Opt-in is controlled by RBAC.
+    - Opt-Out - Attached to tenant networks by default; tenant opts out by
+                creating a `local_service_binding` with `enabled=false` for
+                that (service, network) pair.
+    - Opt-In - Not attached to tenant networks by default; tenant opts in by
+               creating a `local_service_binding` with `enabled=true`.
+
+The "effective attachment" rule is:
+
+| service.attachment_policy | binding row state                | effective |
+| ------------------------- | -------------------------------- | --------- |
+| `opt-in`                  | none                             | no        |
+| `opt-in`                  | `enabled=true`                   | yes       |
+| `opt-in`                  | `enabled=false`                  | no        |
+| `opt-out`                 | none                             | **yes**   |
+| `opt-out`                 | `enabled=true` (redundant)       | yes       |
+| `opt-out`                 | `enabled=false` (opt-out marker) | **no**    |
+| any                       | any                              | no if `service.enabled=false` |
+
+For opt-out services, the binding row functions as the opt-out marker
+when `enabled=false`. An `enabled=true` binding for an opt-out service is
+accepted as a no-op — the service is already implicitly attached.
+
+Opt-out fan-out is realized by a periodic reconciler in the service plugin
+(`[local_services] plugin_reconciler_interval`, default 60s) that walks
+every Neutron network and ensures localports + DHCP host_routes match the
+effective set. The same reconciler routine fires synchronously on every
+binding create/update/delete, so explicit changes apply immediately.
+
+> Note: per-tenant RBAC enforcement of opt-in / opt-out is out of scope
+> for the PoC — see `docs/limitations.md` §3. Today, any admin-token
+> caller can create or delete any binding row, regardless of the
+> service's policy.
 
 #### Service Definition (Admin Fields)
 
@@ -532,6 +560,12 @@ injection of `<vip>/32 via <localport-fixed-ip>` on every IPv4 subnet,
 and (c) Port_Binding events at the chassis hosting the localport that
 drive netns + plugin reconcile. Deleting the last binding for a network
 reverses all three.
+
+For opt-out services, the same (a)/(b)/(c) side-effects are driven by
+the service-plugin's periodic reconciler — no explicit binding row is
+needed. Creating an `enabled=false` binding for an opt-out service
+removes that service from the network; the localport is also removed
+once no other services are effectively attached.
 
 #### Default RBAC
 

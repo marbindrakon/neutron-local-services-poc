@@ -280,6 +280,13 @@ class TestPluginBindingHooks(testtools.TestCase):
                 group='service_providers')
         except cfg.DuplicateOptError:
             pass
+        # Block the periodic reconciler from starting under test; we
+        # don't want a stray greenthread firing _reconcile_loop in the
+        # background.
+        self.reconciler_patch = mock.patch.object(
+            plugin_mod.LocalServicesPlugin, '_start_reconciler')
+        self.reconciler_patch.start()
+        self.addCleanup(self.reconciler_patch.stop)
         # Build the plugin fresh; patch directory.get_plugin so the
         # _core_plugin property resolves to our mock.
         self.plugin_mod = plugin_mod
@@ -307,12 +314,44 @@ class TestPluginBindingHooks(testtools.TestCase):
             self.plugin, '_refresh_subnet_routes')
         self.refresh_mock = self.refresh_patch.start()
         self.addCleanup(self.refresh_patch.stop)
+        # _reconcile_network -> _enabled_services_for_network calls
+        # both get_local_service_bindings and get_local_services. Tests
+        # in this class only care about the binding-driven path, so
+        # default opt-out catalog is empty unless a test overrides.
+        self.get_services_patch = mock.patch.object(
+            self.plugin, 'get_local_services', return_value=[])
+        self.get_services_patch.start()
+        self.addCleanup(self.get_services_patch.stop)
+        # Default: no bindings on the network. Tests override per case.
+        self.get_bindings_patch = mock.patch.object(
+            self.plugin, 'get_local_service_bindings', return_value=[])
+        self.get_bindings_patch.start()
+        self.addCleanup(self.get_bindings_patch.stop)
+
+    def _enabled_opt_in_svc(self, sid='svc'):
+        """Stage an enabled opt-in service in the catalog mocks so
+        ``_enabled_services_for_network`` sees the binding's service
+        as effective."""
+        svc = {'id': sid, 'enabled': True,
+               'attachment_policy': 'opt-in', 'local_ipv4': '1.1.1.1'}
+        # get_local_service is keyed by id; the simple stub returns
+        # the same svc for any id since these tests only use one.
+        self.plugin.get_local_service = mock.Mock(return_value=svc)
+        return svc
 
     def test_create_binding_ensures_localport(self):
         ctx = mock.Mock()
-        super_create = mock.Mock(return_value={
+        binding_dict = {
             'id': 'binding-id', 'network_id': NET_ID,
-            'service_id': 'svc', 'project_id': 'tproj', 'enabled': True})
+            'service_id': 'svc', 'project_id': 'tproj', 'enabled': True}
+        super_create = mock.Mock(return_value=binding_dict)
+        # Post-create the binding is in the catalog: the reconcile pass
+        # must see it as an enabled opt-in attachment so it ensures the
+        # localport.
+        self.get_bindings_patch.stop()
+        self.plugin.get_local_service_bindings = mock.Mock(
+            return_value=[binding_dict])
+        self._enabled_opt_in_svc()
         with mock.patch.object(
                 self.plugin_mod.local_services_db.LocalServicesDbMixin,
                 'create_local_service_binding', super_create):
@@ -324,12 +363,19 @@ class TestPluginBindingHooks(testtools.TestCase):
 
     def test_create_binding_rolls_back_on_localport_failure(self):
         ctx = mock.Mock()
-        super_create = mock.Mock(return_value={
+        binding_dict = {
             'id': 'binding-id', 'network_id': NET_ID,
-            'service_id': 'svc', 'project_id': 'tproj', 'enabled': True})
+            'service_id': 'svc', 'project_id': 'tproj', 'enabled': True}
+        super_create = mock.Mock(return_value=binding_dict)
         super_delete = mock.Mock()
         # Force ensure_localport to fail by making create_port raise.
         self.create_port_mock.side_effect = RuntimeError('boom')
+        # Post-create the binding is in the catalog so reconcile tries
+        # to ensure the localport.
+        self.get_bindings_patch.stop()
+        self.plugin.get_local_service_bindings = mock.Mock(
+            return_value=[binding_dict])
+        self._enabled_opt_in_svc()
         with mock.patch.object(
                 self.plugin_mod.local_services_db.LocalServicesDbMixin,
                 'create_local_service_binding', super_create), \
@@ -348,13 +394,14 @@ class TestPluginBindingHooks(testtools.TestCase):
         binding = {'id': 'binding-id', 'network_id': NET_ID,
                    'service_id': 'svc', 'project_id': 'tproj',
                    'enabled': True}
+        other_binding = {'id': 'other-binding', 'network_id': NET_ID,
+                         'service_id': 'other-svc', 'project_id': 'tproj',
+                         'enabled': True}
         # Pretend a different binding still exists on the network.
-        get_bindings = mock.Mock(return_value=[
-            {'id': 'other-binding', 'network_id': NET_ID,
-             'service_id': 'other-svc', 'project_id': 'tproj',
-             'enabled': True}])
+        get_bindings = mock.Mock(return_value=[other_binding])
         super_delete = mock.Mock()
         self.core.get_ports.return_value = [_make_our_port()]
+        self._enabled_opt_in_svc(sid='other-svc')
         with mock.patch.object(
                 self.plugin, 'get_local_service_binding',
                 return_value=binding), \
