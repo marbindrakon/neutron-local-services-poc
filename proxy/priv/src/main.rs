@@ -48,6 +48,15 @@ fn main() -> Result<()> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create_dir_all({})", parent.display()))?;
+        // Make the runtime dir group-owned by the peer group so the
+        // worker (a member of that group) can both traverse the
+        // directory and discover the socket. Doing this from the
+        // binary instead of relying on a systemd ExecStartPost is
+        // more reliable: services with ProtectSystem=strict can have
+        // a private mount view of /run for which an external chgrp
+        // run by systemd doesn't propagate to peers' views.
+        chgrp(parent, peer_gid)?;
+        chmod_2770(parent)?;
     }
     if socket_path.exists() {
         std::fs::remove_file(&socket_path).ok();
@@ -186,6 +195,16 @@ fn chmod_0660(path: &std::path::Path) -> Result<()> {
     let perms = std::fs::Permissions::from_mode(0o660);
     std::fs::set_permissions(path, perms)
         .with_context(|| format!("chmod 0660 {}", path.display()))
+}
+
+fn chmod_2770(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Setgid + 0770: setgid makes new files inside inherit the dir's
+    // group (nls-admin), so sockets the worker creates land
+    // group-readable by the agent without each binary having to chgrp.
+    let perms = std::fs::Permissions::from_mode(0o2770);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("chmod 2770 {}", path.display()))
 }
 
 fn handle_connection(stream: std::os::unix::net::UnixStream) -> Result<()> {
