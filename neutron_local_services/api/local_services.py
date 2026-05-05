@@ -12,6 +12,7 @@ consistency. Validation is the cheap kind here; deeper checks belong
 in the plugin.
 """
 
+from neutron_lib.api import converters
 from neutron_lib import constants as nl_const
 from neutron_lib.db import constants as db_const
 
@@ -143,7 +144,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         },
         'enabled': {
             'allow_post': True, 'allow_put': True,
-            'default': True, 'convert_to': lambda v: bool(v),
+            'default': True, 'convert_to': converters.convert_to_boolean,
             'is_filter': True, 'is_visible': True,
         },
     },
@@ -187,7 +188,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         },
         'enabled': {
             'allow_post': True, 'allow_put': True,
-            'default': True, 'convert_to': lambda v: bool(v),
+            'default': True, 'convert_to': converters.convert_to_boolean,
             'is_filter': True, 'is_visible': True,
         },
     },
@@ -206,7 +207,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         },
         'enabled': {
             'allow_post': True, 'allow_put': True,
-            'default': True, 'convert_to': lambda v: bool(v),
+            'default': True, 'convert_to': converters.convert_to_boolean,
             'is_filter': True, 'is_visible': True,
         },
     },

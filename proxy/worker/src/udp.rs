@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use crate::catalog::Entry;
 use crate::hc::{BackendId, Status, StatusMap};
 use crate::lb::Selector;
-use crate::quota::ListenerQuota;
+use crate::quota::{ListenerQuota, QuotaGuard};
 
 const MAX_DATAGRAM: usize = 65535;
 
@@ -31,6 +31,11 @@ struct Session {
     backend_socket: Arc<tokio::net::UdpSocket>,
     last_seen: Instant,
     reply_task: AbortHandle,
+    // Hold the quota slot for the lifetime of the session. Dropping
+    // the guard on session eviction releases the slot. UDP has no
+    // clean close event, so the session table size IS the live
+    // counter — capped here on insert.
+    _quota: QuotaGuard,
 }
 
 impl Drop for Session {
@@ -82,18 +87,16 @@ pub async fn run(
                         let backend_socket = if let Some(s) = session {
                             Arc::clone(&s.backend_socket)
                         } else {
-                            // New session.
-                            if quota.try_acquire().is_none() {
-                                tracing::warn!(?peer, "udp session quota breach; dropping");
-                                continue;
-                            }
-                            // We released the guard immediately above
-                            // because UDP sessions don't have a clean
-                            // close event; we count via session-table
-                            // size on /metrics instead. The
-                            // `quota.in_flight` doubles as a TCP
-                            // counter; UDP cap is enforced via
-                            // catalog `max_concurrent` checked here.
+                            // New session — hold the guard for the
+                            // session lifetime so the listener cap
+                            // actually bounds live UDP sessions.
+                            let guard = match quota.try_acquire() {
+                                Some(g) => g,
+                                None => {
+                                    tracing::warn!(?peer, "udp session quota breach; dropping");
+                                    continue;
+                                }
+                            };
                             let backend = selector.pick(&entry, |b| {
                                 let id = BackendId::from(&entry, b);
                                 matches!(status.get(&id), Some(Status::Up) | Some(Status::Unknown) | None)
@@ -148,6 +151,7 @@ pub async fn run(
                                     backend_socket: Arc::clone(&host_socket),
                                     last_seen: Instant::now(),
                                     reply_task: join.abort_handle(),
+                                    _quota: guard,
                                 },
                             );
                             host_socket

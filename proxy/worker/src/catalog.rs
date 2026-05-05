@@ -323,6 +323,31 @@ fn validate(catalog: &Catalog) -> Result<()> {
                 entry.proto
             );
         }
+        validate_health_check(&entry.health_check)
+            .with_context(|| format!("entries[{i}].health_check"))?;
+    }
+    Ok(())
+}
+
+fn validate_health_check(hc: &HealthCheck) -> Result<()> {
+    match hc {
+        HealthCheck::HttpGet { path, .. } => validate_http_origin_form_path(path),
+        _ => Ok(()),
+    }
+}
+
+/// Reject HTTP request-target paths that aren't origin-form or that
+/// contain CR/LF/NUL — anything that could break out of the request
+/// line we interpolate into. RFC 7230 origin-form: must start with
+/// `/`, may carry a `?query`. We allow only printable ASCII (0x21..=0x7E).
+fn validate_http_origin_form_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("HTTP HC path must be origin-form (start with '/'); got {path:?}");
+    }
+    for (i, b) in path.bytes().enumerate() {
+        if !(0x21..=0x7E).contains(&b) {
+            bail!("HTTP HC path has disallowed byte 0x{b:02x} at offset {i}");
+        }
     }
     Ok(())
 }

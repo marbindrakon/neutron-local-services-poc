@@ -255,6 +255,13 @@ async fn probe_http(
         // we treat HTTPS HC as a TCP-connect with longer timeout.
         return probe_tcp(addr, to).await;
     }
+    // Defense in depth: catalog validation already rejects non-origin-form
+    // and CR/LF in HC paths, but never interpolate an unvalidated path
+    // into a request line.
+    if !path.starts_with('/') || path.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+        tracing::warn!(?path, "refusing http hc with malformed path");
+        return false;
+    }
     let mut stream = match timeout(to, tokio::net::TcpStream::connect(addr)).await {
         Ok(Ok(s)) => s,
         _ => return false,

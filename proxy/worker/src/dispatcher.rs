@@ -53,9 +53,14 @@ impl Dispatcher {
         let tenants: Arc<Mutex<HashMap<String, TenantHandle>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        let our_uid = nix::unistd::geteuid().as_raw();
+
         for client in listener.incoming() {
             match client {
                 Ok(stream) => {
+                    if !peer_uid_matches(&stream, our_uid) {
+                        continue;
+                    }
                     let tenants = Arc::clone(&tenants);
                     let priv_socket = self.priv_socket.clone();
                     let catalog_rx = self.catalog_rx.clone();
@@ -79,6 +84,37 @@ impl Dispatcher {
             }
         }
         Ok(())
+    }
+}
+
+/// AddNetns must arrive with exactly one fd in SCM_RIGHTS. Surplus
+/// fds are dropped (and their SCM_RIGHTS-allocated kernel state
+/// closed) when the rejected `Vec<OwnedFd>` falls out of scope.
+/// Type validation (fd-is-a-netns-fd) is enforced by the priv helper
+/// before `setns`; we don't duplicate the ioctl in this `#![forbid(unsafe)]`
+/// crate.
+fn exactly_one_netns_fd(fds: Vec<OwnedFd>) -> Result<OwnedFd, String> {
+    let n = fds.len();
+    if n != 1 {
+        return Err(format!(
+            "AddNetns: expected exactly 1 fd in SCM_RIGHTS, got {n}"
+        ));
+    }
+    Ok(fds.into_iter().next().expect("len checked"))
+}
+
+fn peer_uid_matches(stream: &UnixStream, expected_uid: u32) -> bool {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    match getsockopt(stream, PeerCredentials) {
+        Ok(c) if c.uid() == expected_uid => true,
+        Ok(c) => {
+            tracing::warn!(peer_uid = c.uid(), expected_uid, "control: rejecting foreign-uid peer");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "control: SO_PEERCRED failed; rejecting");
+            false
+        }
     }
 }
 
@@ -150,11 +186,9 @@ fn dispatch(
 ) -> ControlResponse {
     match req {
         ControlRequest::AddNetns { net_id } => {
-            let netns_fd = match fds.into_iter().next() {
-                Some(fd) => fd,
-                None => return ControlResponse::Error {
-                    msg: "AddNetns: missing netns fd in SCM_RIGHTS".into(),
-                },
+            let netns_fd = match exactly_one_netns_fd(fds) {
+                Ok(fd) => fd,
+                Err(msg) => return ControlResponse::Error { msg },
             };
             let mut guard = tenants.lock().expect("tenants mutex poisoned");
             if guard.contains_key(&net_id) {

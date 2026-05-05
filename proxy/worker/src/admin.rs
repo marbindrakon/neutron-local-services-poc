@@ -8,11 +8,12 @@
 //!
 //! All routes except `/healthz` require `Authorization: Bearer <token>`
 //! where `<token>` is the contents of the per-boot token file
-//! configured at startup.
+//! configured at startup. The bearer compare is constant-time.
 //!
-//! The unix socket itself is mode 0600 + group `nls-admin` (chosen by
-//! the systemd unit). Bearer-token auth is defense-in-depth against
-//! anyone who already has the socket fd.
+//! Peer authorization: every accepted connection must come from a peer
+//! whose effective uid matches the worker's own uid (the agent runs as
+//! the same user). Filesystem mode is hardening on top of that, not
+//! authorization on its own.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -80,8 +81,21 @@ async fn serve(socket_path: PathBuf, state: AdminState) -> Result<()> {
 
     tracing::info!(path = %socket_path.display(), "admin listening on unix socket");
 
+    let our_uid = nix::unistd::geteuid().as_raw();
+
     loop {
         let (stream, _) = listener.accept().await?;
+        match stream.peer_cred() {
+            Ok(cred) if cred.uid() == our_uid => {}
+            Ok(cred) => {
+                tracing::warn!(peer_uid = cred.uid(), "rejecting admin conn from foreign uid");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "admin peer_cred failed; dropping conn");
+                continue;
+            }
+        }
         let app = app.clone();
         tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(app);
@@ -115,10 +129,26 @@ fn require_auth(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     let prefix = "Bearer ";
-    if !got.starts_with(prefix) || &got[prefix.len()..] != expected {
+    let presented = got.strip_prefix(prefix).unwrap_or("");
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
+}
+
+/// Length-prefixed constant-time byte compare. Returns `false` for
+/// length mismatch without touching either buffer further; for equal
+/// lengths the loop's branch count is independent of where the bytes
+/// differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn clusters(
