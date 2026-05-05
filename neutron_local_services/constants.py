@@ -75,6 +75,19 @@ DEFAULT_VIP_DENYLIST = (
     'fe80::a9fe:a9fe',  # OpenStack metadata IPv6
 )
 
+# Default allow-list of CIDRs from which VIPs MAY be allocated. Tighter
+# than the denylist on its own: the host_routes injector writes /32
+# routes into tenant subnets, so a VIP outside link-local would let an
+# operator-managed service silently override tenant routing for any
+# destination. Operators can override; we default to RFC3927/4291
+# link-local plus the IPv6 fe80::/10 link-local block. The metadata
+# IPs in DEFAULT_VIP_DENYLIST are still excluded after this allowlist
+# match.
+DEFAULT_ALLOWED_VIP_CIDRS = (
+    '169.254.0.0/16',  # IPv4 link-local
+    'fe80::/10',       # IPv6 link-local
+)
+
 # Underlay-egress veth pair (per network), distinct from the tenant-side
 # `tls<net[:10]>X` veth that lives on br-int. Linux IFNAMSIZ-1=15 char
 # budget: 4-char prefix + 9 net hex chars + 1 suffix = 14.

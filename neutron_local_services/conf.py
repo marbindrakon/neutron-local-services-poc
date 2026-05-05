@@ -22,10 +22,21 @@ AGENT_AUTH_GROUP = 'local_services_agent'
 
 OPTS = [
     cfg.ListOpt(
+        'allowed_vip_cidrs',
+        default=list(lsc.DEFAULT_ALLOWED_VIP_CIDRS),
+        help='CIDRs from which local-service VIPs may be allocated. A '
+             'VIP must fall inside one of these CIDRs (and must not be '
+             'in vip_denylist). Default: IPv4 + IPv6 link-local. The '
+             'host_routes injector writes /32 routes into tenant '
+             'subnets, so a VIP outside link-local would let an '
+             'operator-managed service silently override tenant routing.',
+    ),
+    cfg.ListOpt(
         'vip_denylist',
         default=list(lsc.DEFAULT_VIP_DENYLIST),
-        help='IPs that may not be used as local-service VIPs. '
-             'Defaults include the OpenStack metadata IPs.',
+        help='IPs that may not be used as local-service VIPs even if '
+             'they fall inside an allowed_vip_cidrs entry. Defaults '
+             'include the OpenStack metadata IPs.',
     ),
     cfg.IntOpt(
         'reconciler_interval',
