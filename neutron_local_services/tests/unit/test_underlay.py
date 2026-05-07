@@ -164,6 +164,81 @@ class TestAllocator(testtools.TestCase):
                           '100.64.0.0/31', state_dir=self.tmpdir)
 
 
+# --- Chassis chain ------------------------------------------------------
+
+
+class TestInstallChassisChain(testtools.TestCase):
+    """Pin the chassis-wide iptables prelude.
+
+    The chain is jumped from BOTH FORWARD and INPUT. FORWARD covers
+    "tenant netns → remote backend" (the design happy path). INPUT
+    covers "tenant netns → chassis host IP" (e.g. ``172.18.0.128`` —
+    the underlay NIC). Without the INPUT jump the per-net DROP-by-
+    default ACL doesn't apply to host-bound traffic, and a process in
+    the tenant netns can reach every host-listening socket on the
+    chassis. The INPUT rule is a fix for that isolation gap.
+
+    Spy on the helpers (``_ensure_chain`` / ``_ensure_rule`` /
+    ``_exec_root``) rather than the iptables binary itself — the
+    helpers are the public seam, and asserting on the rule tuples is
+    far less brittle than reconstructing the exact ``-C`` / ``-A``
+    sequence the helpers emit.
+    """
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(underlay, '_ensure_chain')
+        self.ensure_chain = p.start(); self.addCleanup(p.stop)
+        p = mock.patch.object(underlay, '_ensure_rule')
+        self.ensure_rule = p.start(); self.addCleanup(p.stop)
+        # The chassis-chain code only calls _exec_root when something
+        # else (sysctl, modprobe-style commands) needs it; mock so
+        # nothing actually shells out under test.
+        p = mock.patch.object(underlay, '_exec_root')
+        p.start(); self.addCleanup(p.stop)
+        underlay._chassis_chain_installed.clear()
+
+    def _has_rule(self, table, chain, args):
+        target = (table, chain, list(args))
+        return any(
+            (c.args[0], c.args[1], list(c.args[2])) == target
+            for c in self.ensure_rule.call_args_list)
+
+    def test_jumps_from_forward(self):
+        # Pre-existing FORWARD jump remains. Regression canary.
+        underlay.install_chassis_chain('100.64.0.0/22')
+        self.assertTrue(self._has_rule(
+            'filter', 'FORWARD', ['-j', lsc.UNDERLAY_HOST_CHAIN]))
+
+    def test_jumps_from_input_for_underlay_veths(self):
+        # New rule that closes the tenant→host-IP isolation gap.
+        # The jump is scoped to ``-i nlsu+`` so it doesn't affect
+        # unrelated host traffic on other interfaces.
+        underlay.install_chassis_chain('100.64.0.0/22')
+        self.assertTrue(self._has_rule(
+            'filter', 'INPUT',
+            ['-i', lsc.UNDERLAY_VETH_PREFIX + '+',
+             '-j', lsc.UNDERLAY_HOST_CHAIN]))
+
+    def test_drops_inter_tenant_cross_talk(self):
+        underlay.install_chassis_chain('100.64.0.0/22')
+        self.assertTrue(self._has_rule(
+            'filter', lsc.UNDERLAY_HOST_CHAIN,
+            ['-i', lsc.UNDERLAY_VETH_PREFIX + '+',
+             '-o', lsc.UNDERLAY_VETH_PREFIX + '+',
+             '-j', 'DROP']))
+
+    def test_accepts_established_related(self):
+        # The chain runs as both a FORWARD and an INPUT consumer, so
+        # the ESTABLISHED/RELATED ACCEPT must come first to let return
+        # traffic flow on whichever path it took out.
+        underlay.install_chassis_chain('100.64.0.0/22')
+        self.assertTrue(self._has_rule(
+            'filter', lsc.UNDERLAY_HOST_CHAIN,
+            ['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
+             '-j', 'ACCEPT']))
+
+
 # --- Provision / teardown -----------------------------------------------
 
 

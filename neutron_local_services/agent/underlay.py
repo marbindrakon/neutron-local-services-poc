@@ -303,6 +303,7 @@ def install_chassis_chain(pool_cidr):
 
     Sets up:
       - filter/NEUTRON_LOCAL_SVC_UNDERLAY chain, jumped from FORWARD
+        AND from INPUT with ``-i nlsu+``
       - filter/NEUTRON_LOCAL_SVC_UNDERLAY: ESTABLISHED,RELATED ACCEPT
       - filter/NEUTRON_LOCAL_SVC_UNDERLAY: -i nlsu+ -o nlsu+ DROP
         (block inter-tenant cross-talk via underlay)
@@ -310,10 +311,25 @@ def install_chassis_chain(pool_cidr):
 
     Per-network jumps and per-network sub-chains are added by
     ``provision_for_network()``.
+
+    Why both FORWARD and INPUT: the per-net allow list is "this tenant
+    may only egress to these backends". A packet from inside the netns
+    destined to a *remote* IP traverses FORWARD on the host root netns,
+    which the existing jump covers. A packet destined to the *chassis
+    host's own* IP (e.g. ``172.18.0.128`` — the underlay NIC) is local
+    delivery and traverses INPUT instead, bypassing FORWARD entirely.
+    Without the INPUT jump a tenant netns could reach every host-bound
+    socket on the chassis (kubelet, ssh, etcd, etc.) — which the
+    architecture documents as forbidden. Adding the INPUT jump runs
+    the same per-net DROP-by-default ACL on host-bound traffic, closing
+    that hole. Backend egress is unaffected because it goes through
+    FORWARD, not INPUT.
     """
     chain = lsc.UNDERLAY_HOST_CHAIN
     _ensure_chain(chain, table='filter')
     _ensure_rule('filter', 'FORWARD', ['-j', chain])
+    _ensure_rule('filter', 'INPUT',
+                 ['-i', lsc.UNDERLAY_VETH_PREFIX + '+', '-j', chain])
     _ensure_rule('filter', chain,
                  ['-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
                   '-j', 'ACCEPT'])
