@@ -50,7 +50,13 @@ class TestRegistryClient(testtools.TestCase):
             for key, resp in mapping.items():
                 if key in url:
                     return resp
-            return _Resp(404, {})
+            # Default fallback for URLs the test didn't stage. We
+            # return an empty-body 200 (rather than a 404) because
+            # ``desired_state_for_network`` always fetches both the
+            # binding list and the opt-out catalog; tests that only
+            # care about one of those would otherwise need to stage
+            # the other just to avoid spurious RegistryFetchError.
+            return _Resp(200, {})
         self.session.get.side_effect = _get
 
     def test_returns_set_of_vip_cidrs(self):
@@ -142,18 +148,21 @@ class TestRegistryClient(testtools.TestCase):
         self.assertEqual(set(),
                          self.client.desired_vips_for_network(NET_ID))
 
-    def test_returns_empty_on_bindings_api_error(self):
-        # 500 on the bindings list — log and return empty rather than
-        # propagate, so the agent thread doesn't die on a transient
-        # API blip.
+    def test_raises_on_bindings_api_error(self):
+        # 500 on the bindings list must raise RegistryFetchError so the
+        # caller (agent extension) can fall back to last-known-good
+        # state instead of withdrawing every VIP on a transient blip.
         self._set_responses({
             'local_service_bindings': _Resp(500, 'oops'),
         })
-        self.assertEqual(set(),
-                         self.client.desired_vips_for_network(NET_ID))
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_vips_for_network, NET_ID)
 
-    def test_returns_partial_set_on_per_service_error(self):
-        # First service errors, second succeeds. We get the second's VIP.
+    def test_raises_on_per_service_error(self):
+        # If any per-service fetch fails we must signal the failure up.
+        # Returning a partial answer would falsely tell the caller "the
+        # other service is gone, withdraw it" — exactly what LKG
+        # caching was added to prevent.
         svc_a, svc_b = 'svc-aa', 'svc-bb'
         self._set_responses({
             'local_service_bindings': _Resp(200, {
@@ -168,8 +177,8 @@ class TestRegistryClient(testtools.TestCase):
                 'local_service': {'local_ipv4': '169.254.2.2',
                                   'enabled': True}}),
         })
-        self.assertEqual({'169.254.2.2/32'},
-                         self.client.desired_vips_for_network(NET_ID))
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_vips_for_network, NET_ID)
 
     def test_filters_disabled_binding(self):
         # Server-side filter (``?enabled=True``) carries the load, but
@@ -197,14 +206,26 @@ class TestRegistryClient(testtools.TestCase):
                      if svc_id in c.args[0]]
         self.assertEqual(0, len(svc_calls))
 
-    def test_returns_empty_when_endpoint_unavailable(self):
+    def test_raises_when_endpoint_unavailable(self):
         # Catalog has no `network` service — agent can't reach the API.
-        # Don't crash; subsequent reconcile passes will retry.
+        # That's a fetch failure, not "no VIPs desired"; signal it up
+        # so the caller preserves last-known-good rather than thrashing
+        # the tap to empty on every periodic tick during a Keystone
+        # outage.
         self.client._endpoint = None
         from keystoneauth1 import exceptions as ks_exc
         self.session.get_endpoint.side_effect = ks_exc.EndpointNotFound()
-        self.assertEqual(set(),
-                         self.client.desired_vips_for_network(NET_ID))
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_vips_for_network, NET_ID)
+
+    def test_raises_on_request_exception(self):
+        # Transport-level failure (DNS, TCP RST, TLS hiccup): the
+        # session.get call itself raises. Translate into our typed
+        # exception so callers don't have to special-case requests
+        # internals.
+        self.session.get.side_effect = RuntimeError('connection reset')
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_vips_for_network, NET_ID)
 
 
 class TestDesiredStateForNetwork(testtools.TestCase):
@@ -229,7 +250,13 @@ class TestDesiredStateForNetwork(testtools.TestCase):
             for key, resp in mapping.items():
                 if key in url:
                     return resp
-            return _Resp(404, {})
+            # Default fallback for URLs the test didn't stage. We
+            # return an empty-body 200 (rather than a 404) because
+            # ``desired_state_for_network`` always fetches both the
+            # binding list and the opt-out catalog; tests that only
+            # care about one of those would otherwise need to stage
+            # the other just to avoid spurious RegistryFetchError.
+            return _Resp(200, {})
         self.session.get.side_effect = _get
 
     def test_returns_full_service_with_backends(self):
@@ -304,14 +331,19 @@ class TestDesiredStateForNetwork(testtools.TestCase):
         self.assertEqual(1, len(services[0]['backends']))
         self.assertEqual('10.0.0.1', services[0]['backends'][0]['address'])
 
-    def test_returns_empty_on_bindings_error(self):
-        # Same defensive shape as the vips path.
+    def test_raises_on_bindings_error(self):
+        # A bindings-list error means we don't know what's attached.
+        # Raise so the caller can keep last-known-good.
         self._set_responses({'local_service_bindings': _Resp(500, 'oops')})
-        self.assertEqual([],
-                         self.client.desired_state_for_network(NET_ID))
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_state_for_network, NET_ID)
 
-    def test_partial_success_on_per_service_error(self):
-        # First service errors, second succeeds → second appears alone.
+    def test_raises_on_per_service_error(self):
+        # An enabled binding row promises the service exists. If the
+        # per-service GET fails we don't synthesize a partial answer —
+        # we raise so the agent reuses last-known-good for *all*
+        # services on this network. A partial answer would have looked
+        # exactly like "svc_a was deleted, withdraw it".
         svc_a, svc_b = 'svc-a', 'svc-b'
         self._set_responses({
             'local_service_bindings': _Resp(200, {
@@ -328,11 +360,13 @@ class TestDesiredStateForNetwork(testtools.TestCase):
             'local_service_backends': _Resp(200, {
                 'local_service_backends': []}),
         })
-        services = self.client.desired_state_for_network(NET_ID)
-        self.assertEqual(1, len(services))
-        self.assertEqual('169.254.2.2', services[0]['local_ipv4'])
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_state_for_network, NET_ID)
 
-    def test_backend_fetch_error_yields_empty_list(self):
+    def test_raises_on_backend_fetch_error(self):
+        # Same logic as the per-service case: an empty backend list on
+        # a service that *should* have backends would look like "all
+        # backends drained". Raise so LKG kicks in.
         svc_id = 'svc-aa'
         self._set_responses({
             'local_service_bindings': _Resp(200, {
@@ -346,11 +380,8 @@ class TestDesiredStateForNetwork(testtools.TestCase):
             }),
             'local_service_backends': _Resp(500, 'down'),
         })
-        services = self.client.desired_state_for_network(NET_ID)
-        self.assertEqual(1, len(services))
-        # Backends list is empty rather than missing — plugin code can
-        # iterate without a None-check.
-        self.assertEqual([], services[0]['backends'])
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_state_for_network, NET_ID)
 
     def test_vips_path_still_works_via_state(self):
         # desired_vips_for_network now derives from desired_state. Make
@@ -401,7 +432,13 @@ class TestDesiredStateOptOut(testtools.TestCase):
             for key, resp in mapping.items():
                 if key in url:
                     return resp
-            return _Resp(404, {})
+            # Default fallback for URLs the test didn't stage. We
+            # return an empty-body 200 (rather than a 404) because
+            # ``desired_state_for_network`` always fetches both the
+            # binding list and the opt-out catalog; tests that only
+            # care about one of those would otherwise need to stage
+            # the other just to avoid spurious RegistryFetchError.
+            return _Resp(200, {})
         self.session.get.side_effect = _get
 
     def test_opt_out_no_binding_appears_in_state(self):
@@ -489,11 +526,12 @@ class TestDesiredStateOptOut(testtools.TestCase):
         services = self.client.desired_state_for_network(NET_ID)
         self.assertEqual({in_id, out_id}, {s['id'] for s in services})
 
-    def test_opt_out_query_failure_yields_explicit_only(self):
-        # If the catalog query for opt-out services fails, we still
-        # return whatever the explicit-binding path produced. Guards
-        # the agent against a partial-API outage taking the chassis to
-        # a fully-empty state.
+    def test_raises_on_opt_out_query_failure(self):
+        # An opt-out catalog failure means we can't enumerate implicit
+        # attachments. Returning explicit-only would withdraw every
+        # implicit-attached service on every network — exactly the
+        # failure mode last-known-good caching exists to prevent.
+        # Raise; let the caller fall back.
         in_id = 'svc-in'
         self._set_responses({
             'local_service_bindings': _Resp(200, {
@@ -509,5 +547,5 @@ class TestDesiredStateOptOut(testtools.TestCase):
             'local_service_backends': _Resp(200, {
                 'local_service_backends': []}),
         })
-        services = self.client.desired_state_for_network(NET_ID)
-        self.assertEqual([in_id], [s['id'] for s in services])
+        self.assertRaises(registry_client.RegistryFetchError,
+                          self.client.desired_state_for_network, NET_ID)

@@ -17,6 +17,7 @@ from ovsdbapp.backend.ovs_idl import event as row_event
 
 from neutron_local_services import constants as lsc
 from neutron_local_services.agent import extension as ext
+from neutron_local_services.agent import registry_client
 
 
 NET_ID = '11111111-1111-1111-1111-111111111111'
@@ -241,6 +242,16 @@ class TestVipReconcilerWiring(testtools.TestCase):
         self.extension.reconcile_vips_for_network(NET_ID)  # no raise
         self.netns.reconcile_vips.assert_not_called()
 
+    def test_reconcile_skips_on_registry_fetch_error(self):
+        # The VIP-only path doesn't have an LKG cache (only the combined
+        # path does). On RegistryFetchError the right thing is to skip
+        # the netns call entirely so we don't withdraw VIPs that may
+        # still be desired.
+        self.fake_registry.desired_vips_for_network.side_effect = (
+            registry_client.RegistryFetchError('keystone down'))
+        self.extension.reconcile_vips_for_network(NET_ID)  # no raise
+        self.netns.reconcile_vips.assert_not_called()
+
     def test_reconcile_swallows_netns_exception(self):
         self.fake_registry.desired_vips_for_network.return_value = set()
         self.netns.reconcile_vips.side_effect = OSError('iproute2 fail')
@@ -454,3 +465,149 @@ class TestReconcileNetwork(testtools.TestCase):
         evt.run(None, _row(), None)
         self.assertEqual(['plugin', 'netns'], call_order)
         self.fake_lvs.teardown.assert_called_once_with('localsvc-' + NET_ID)
+
+
+class TestLastKnownGood(testtools.TestCase):
+    """Last-known-good caching of desired state.
+
+    The reconciler must never withdraw VIPs / listener config because of
+    a transient registry/Keystone failure. These tests pin that contract:
+
+    * A successful fetch primes the cache.
+    * A subsequent ``RegistryFetchError`` reconciles against the cached
+      snapshot rather than an empty list.
+    * If the agent has never seen a successful fetch for the network,
+      a fetch failure short-circuits the pass entirely (don't reconcile
+      to empty).
+    * Port_Binding teardown clears the cache so a re-provisioned network
+      doesn't replay stale state.
+    * The ``staleness_seconds`` accessor exposes the age of the cache
+      so operators / tests can monitor how long we've been running blind.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from neutron_local_services.agent.plugins import base as plugins_base
+        plugins_base.reset_for_tests()
+        self.addCleanup(self._restore_real_plugins)
+        self.plugins_base = plugins_base
+
+        self.extension = ext.LocalServicesExtension()
+        self.extension.agent_api = mock.Mock()
+        self.fake_registry = mock.Mock()
+        self.extension._registry = self.fake_registry
+
+        p = mock.patch.object(ext, 'netns')
+        self.netns = p.start(); self.addCleanup(p.stop)
+
+        self.fake_lvs = mock.MagicMock()
+        self.fake_lvs.name = lsc.EXPOSURE_NAT
+        plugins_base._REGISTRY[lsc.EXPOSURE_NAT] = self.fake_lvs
+
+    def _restore_real_plugins(self):
+        self.plugins_base.reset_for_tests()
+        import importlib
+        from neutron_local_services.agent.plugins import nat
+        from neutron_local_services.agent.plugins import proxy
+        importlib.reload(nat)
+        importlib.reload(proxy)
+
+    def _svc(self, **kw):
+        base = {'id': 'svc-aa', 'local_ipv4': '169.254.169.5',
+                'port': 53, 'protocol': lsc.PROTO_UDP,
+                'exposure_plugin': lsc.EXPOSURE_NAT,
+                'enabled': True, 'backends': []}
+        base.update(kw)
+        return base
+
+    def test_successful_fetch_primes_cache(self):
+        svc = self._svc()
+        self.fake_registry.desired_state_for_network.return_value = [svc]
+        self.extension.reconcile_network(NET_ID)
+        self.assertEqual([svc], self.extension._lkg_state[NET_ID])
+        self.assertIsNotNone(self.extension._lkg_ts.get(NET_ID))
+        # Staleness reads as a small positive number on a fresh fetch.
+        age = self.extension.staleness_seconds(NET_ID)
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 0.0)
+
+    def test_falls_back_to_cache_on_registry_fetch_error(self):
+        # First pass populates the cache.
+        svc = self._svc()
+        self.fake_registry.desired_state_for_network.return_value = [svc]
+        self.extension.reconcile_network(NET_ID)
+        self.fake_lvs.apply_config.reset_mock()
+        self.netns.reconcile_vips.reset_mock()
+
+        # Second pass: registry blows up. Plugin still receives the
+        # cached service list — VIPs are NOT withdrawn.
+        self.fake_registry.desired_state_for_network.side_effect = (
+            registry_client.RegistryFetchError('5xx'))
+        self.extension.reconcile_network(NET_ID)
+        self.fake_lvs.apply_config.assert_called_once_with(
+            'localsvc-' + NET_ID, [svc])
+        self.netns.reconcile_vips.assert_called_once_with(
+            NET_ID, {'169.254.169.5/32'})
+
+    def test_skips_when_no_cache_and_fetch_fails(self):
+        # Cold start, registry is down. We've never seen a successful
+        # fetch for this network so there's nothing safe to apply —
+        # don't reconcile to empty (which would withdraw VIPs other
+        # agents on the host might be holding stable).
+        self.fake_registry.desired_state_for_network.side_effect = (
+            registry_client.RegistryFetchError('5xx'))
+        self.extension.reconcile_network(NET_ID)
+        self.fake_lvs.apply_config.assert_not_called()
+        self.netns.reconcile_vips.assert_not_called()
+        # No cache entry was created either — the next pass with a
+        # working registry must populate it from the authoritative fetch.
+        self.assertNotIn(NET_ID, self.extension._lkg_state)
+
+    def test_recovery_updates_cache(self):
+        # Cache an older snapshot, simulate a successful fetch, confirm
+        # the cache gets refreshed (not just read-only).
+        old = self._svc(id='svc-old')
+        self.extension._lkg_state[NET_ID] = [old]
+        self.extension._lkg_ts[NET_ID] = 0.0  # very stale
+
+        new = self._svc(id='svc-new', local_ipv4='169.254.169.99')
+        self.fake_registry.desired_state_for_network.return_value = [new]
+        self.extension.reconcile_network(NET_ID)
+        self.assertEqual([new], self.extension._lkg_state[NET_ID])
+        self.assertGreater(self.extension._lkg_ts[NET_ID], 0.0)
+
+    def test_staleness_seconds_unknown_network_is_none(self):
+        # Don't make up an age for a network we've never fetched.
+        self.assertIsNone(self.extension.staleness_seconds('nope'))
+
+    def test_forget_network_drops_cache(self):
+        self.extension._lkg_state[NET_ID] = [self._svc()]
+        self.extension._lkg_ts[NET_ID] = 12345.0
+        self.extension.forget_network(NET_ID)
+        self.assertNotIn(NET_ID, self.extension._lkg_state)
+        self.assertNotIn(NET_ID, self.extension._lkg_ts)
+        self.assertIsNone(self.extension.staleness_seconds(NET_ID))
+        # And forgetting an unknown network is a no-op (no KeyError).
+        self.extension.forget_network('nope')
+
+    def test_delete_event_clears_cache(self):
+        # Wires the lifecycle: when the localport disappears we drop
+        # cached state so a rebound network starts from scratch.
+        self.extension._lkg_state[NET_ID] = [self._svc()]
+        self.extension._lkg_ts[NET_ID] = 12345.0
+        evt = ext.LocalportPortBindingDeletedEvent(self.extension)
+        evt.run(None, _row(), None)
+        self.assertNotIn(NET_ID, self.extension._lkg_state)
+        self.assertNotIn(NET_ID, self.extension._lkg_ts)
+
+    def test_unexpected_exception_skips_without_writing_cache(self):
+        # An uncategorized exception (not a RegistryFetchError) is logged
+        # and swallowed; the cache must NOT be updated to a stale or
+        # garbage value, and reconcile must skip to avoid acting on
+        # half-fetched data.
+        self.fake_registry.desired_state_for_network.side_effect = (
+            RuntimeError('boom'))
+        self.extension.reconcile_network(NET_ID)
+        self.assertNotIn(NET_ID, self.extension._lkg_state)
+        self.netns.reconcile_vips.assert_not_called()
+        self.fake_lvs.apply_config.assert_not_called()
