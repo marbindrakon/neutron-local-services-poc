@@ -141,16 +141,33 @@ BE_ID_B=$(_curl POST "/v2.0/local_service_backends" \
 if [[ -z "$BE_ID_A" || -z "$BE_ID_B" ]]; then
     fail "per-chassis backend POST returned empty id (a=$BE_ID_A b=$BE_ID_B)"
 fi
-# Allow two keepalived TCP_CHECK passes: first probes both backends
-# (~6s delay_loop + 3s connect_timeout for the cross-chassis fail);
-# second pass lands the LOCAL backend in ipvsadm. ~22s is empirically
-# the safe budget on this lab.
-sleep 22
+# Wait for both chassis's ipvsadm to converge: each shows its LOCAL
+# backend and has pruned the cross-chassis one. The cycle is: agent
+# reconcile (10s tick) → keepalived reload → TCP_CHECK delay_loop
+# (6s) + connect_timeout (3s) for the dead cross-chassis port → next
+# delay_loop lands the local backend. Empirically that takes 20-50s
+# under all_full load — chassis B sometimes lags chassis A by enough
+# that a fixed 22s sleep occasionally caught B mid-converge. Poll
+# instead, with a generous ceiling.
+WAIT=0
+WAIT_LIMIT=70
+IPVS_A=""
+IPVS_B=""
+while [[ "$WAIT" -lt "$WAIT_LIMIT" ]]; do
+    IPVS_A=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_A_IP" "sudo ip netns exec $NS_NAME ipvsadm -L -n 2>/dev/null" || true)
+    IPVS_B=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "sudo ip netns exec $NS_NAME ipvsadm -L -n 2>/dev/null" || true)
+    if echo "$IPVS_A" | grep -q ":${MULTICHASSIS_BACKEND_PORT_A}\b" \
+       && ! echo "$IPVS_A" | grep -q ":${MULTICHASSIS_BACKEND_PORT_B}\b" \
+       && echo "$IPVS_B" | grep -q ":${MULTICHASSIS_BACKEND_PORT_B}\b" \
+       && ! echo "$IPVS_B" | grep -q ":${MULTICHASSIS_BACKEND_PORT_A}\b"; then
+        break
+    fi
+    sleep 2
+    WAIT=$((WAIT+2))
+done
 
 # 5) Per-chassis ipvsadm: each chassis sees the VIP, and crucially ONLY
 #    its local backend (the remote one fails HC and is pruned).
-IPVS_A=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_A_IP" "sudo ip netns exec $NS_NAME ipvsadm -L -n 2>/dev/null")
-IPVS_B=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "sudo ip netns exec $NS_NAME ipvsadm -L -n 2>/dev/null")
 # Both backend addresses are identical (same localport IP), so we
 # distinguish by PORT — A's backend on PORT_A, B's on PORT_B.
 if echo "$IPVS_A" | grep -qE "TCP\s+${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}" \
