@@ -4,29 +4,46 @@
 # Designed to be run from this dev host after `lab-push.sh` succeeds.
 #
 # Usage:
-#   ./devstack/lab-tests/lab-functional.sh [milestone] [user@host]
+#   ./devstack/lab-tests/lab-functional.sh [SELECTOR] [user@host] [-- runner-flags...]
 #
 # Examples:
-#   ./devstack/lab-tests/lab-functional.sh           # 'all', default host
-#   ./devstack/lab-tests/lab-functional.sh m5
-#   ./devstack/lab-tests/lab-functional.sh all almalinux@172.18.0.128
+#   ./devstack/lab-tests/lab-functional.sh                  # 'all', default host
+#   ./devstack/lab-tests/lab-functional.sh smoke
+#   ./devstack/lab-tests/lab-functional.sh 06-nat-plugin almalinux@172.18.0.128
+#   ./devstack/lab-tests/lab-functional.sh all_full almalinux@172.18.0.128 -- --junit out.xml
 #
-# What it does: ssh's the runner script (run-on-lab.sh) onto the lab,
-# executes it as the `stack` user, and streams the output back. The
-# runner is idempotent and self-cleaning, so re-running is fine.
+# SELECTOR is forwarded to runner.sh — see runner.sh --help for the
+# full list (all, all_full, smoke, plugin, multitenant, multichassis,
+# underlay, or a case-id like "06-nat-plugin").
+#
+# What it does: rsyncs the lab-tests dir onto the target, then exec's
+# runner.sh as the `stack` user. Cases are idempotent and self-cleaning
+# so re-running is safe.
 
 set -euo pipefail
 
-MILESTONE="${1:-all}"
+SELECTOR="${1:-all}"
 TARGET="${2:-almalinux@172.18.0.128}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/neutron-localsvc-poc}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Anything after `--` is forwarded to runner.sh on the lab.
+shift $(( $# > 2 ? 2 : $# ))
+RUNNER_ARGS=()
+if [[ "${1:-}" == "--" ]]; then
+    shift
+    RUNNER_ARGS=("$@")
+fi
+
 ssh_opts=(-i "${SSH_KEY}" -o StrictHostKeyChecking=no)
 
-# Push the runner up. /tmp is fine since the script is harmless and self-
-# cleaning; using the lab repo path would mean the script must already be
-# rsynced (chicken-and-egg if run-on-lab.sh itself was just edited).
-scp "${ssh_opts[@]}" "${HERE}/run-on-lab.sh" "${TARGET}:/tmp/run-on-lab.sh" >/dev/null
+# rsync the whole lab-tests tree (cases/, lib/, runner.sh, fixtures).
+# /tmp/lab-tests is a stable scratch path, owned by ${TARGET}'s login
+# user (rsync runs as the SSH user, not stack); the runner is exec'd
+# under stack via sudo -iu below.
+rsync -az --delete -e "ssh ${ssh_opts[*]}" \
+    --exclude '__pycache__' \
+    "${HERE}/" "${TARGET}:/tmp/lab-tests/"
+
 ssh "${ssh_opts[@]}" "${TARGET}" \
-    "sudo -iu stack bash /tmp/run-on-lab.sh ${MILESTONE}"
+    "sudo -iu stack bash /tmp/lab-tests/runner.sh '${SELECTOR}' ${RUNNER_ARGS[*]:-}"
