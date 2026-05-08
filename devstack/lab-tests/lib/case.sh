@@ -104,13 +104,21 @@ requires_underlay_backends() {
     # The underlay test is a no-op if the lab's HTTP / DNS underlay
     # services aren't actually reachable from this chassis. Probe them
     # before running the test body.
+    #
+    # Both probes retry: a single-shot probe is too fragile, since
+    # "lab DNS dropped one UDP packet" or "lab HTTP momentarily under
+    # load" silently flips the whole test to SKIP even though the
+    # backends are otherwise healthy. dig's `+tries=3` retries the
+    # query, curl's `--retry 2 --retry-all-errors` retries the request
+    # — both keep the same timeout-per-try semantics.
     local tcp_probe udp_probe
-    tcp_probe=$(curl -sS --max-time 4 -o /dev/null -w "%{http_code}" \
+    tcp_probe=$(curl -sS --max-time 4 --retry 2 --retry-all-errors --retry-delay 1 \
+        -o /dev/null -w "%{http_code}" \
         "http://${UNDERLAY_TCP_BACKEND_ADDR}:${UNDERLAY_TCP_BACKEND_PORT}/" 2>&1 || true)
     if ! [[ "$tcp_probe" =~ ^[1-5][0-9][0-9]$ ]]; then
         skip "underlay TCP backend ${UNDERLAY_TCP_BACKEND_ADDR}:${UNDERLAY_TCP_BACKEND_PORT} unreachable (got '$tcp_probe')"
     fi
-    udp_probe=$(dig +time=2 +tries=1 "@${UNDERLAY_UDP_BACKEND_ADDR}" -p "${UNDERLAY_UDP_BACKEND_PORT}" example.com a +short 2>&1 | head -1 || true)
+    udp_probe=$(dig +time=2 +tries=3 "@${UNDERLAY_UDP_BACKEND_ADDR}" -p "${UNDERLAY_UDP_BACKEND_PORT}" example.com a +short 2>&1 | head -1 || true)
     if ! [[ "$udp_probe" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         skip "underlay UDP DNS ${UNDERLAY_UDP_BACKEND_ADDR}:${UNDERLAY_UDP_BACKEND_PORT} unreachable (got '$udp_probe')"
     fi
