@@ -34,12 +34,15 @@ PROBE_CLIENT_VETH_ROOT="m8c0"
 PROBE_CLIENT_VETH_NS="m8c1"
 PROBE_CLIENT_PORT_NAME="m8-client-probe"
 
+# Note: the _ENVOY_ prefix is historical. These are proxy-plugin
+# services now (envoy was replaced by the Rust proxy in M11). Names
+# kept stable to avoid churn across config + case bodies.
 # --- Multi-tenant isolation fixtures ------------------------------------
 # Two tenant networks on the same chassis (private + private-m10b), three
 # services exercising both axes:
-#   - svc_a_lvs:   network A, LVS plugin
-#   - svc_a_envoy: network A, Envoy plugin (mixed-plugin in one netns)
-#   - svc_b_envoy: network B, Envoy plugin (multi-tenant)
+#   - svc_a_lvs:   network A, nat (LVS) plugin
+#   - svc_a_envoy: network A, proxy plugin (mixed-plugin in one netns)
+#   - svc_b_envoy: network B, proxy plugin (multi-tenant)
 ISOLATION_NETB_NAME="private-m10b"
 M10_NETB_CIDR="10.10.99.0/24"
 M10_NETB_GW="10.10.99.1"

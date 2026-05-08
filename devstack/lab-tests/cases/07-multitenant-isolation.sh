@@ -2,30 +2,24 @@
 # tags: multitenant
 #
 # Multi-tenant + mixed-plugin isolation: two tenant networks on the same
-# chassis, each with its own VIPs; one network runs both LVS and Envoy
+# chassis, each with its own VIPs; one network runs both LVS and proxy
 # services in the same netns (mixed-plugin). Cross-tenant traffic must
 # be blocked.
 #
-# Currently a no-op: envoy was replaced by the proxy plugin, and the
-# (nat + proxy) mixed-plugin port hasn't landed yet. The test body is
-# preserved below for when proxy coverage is wired in.
+# Plugin shape recap (post-M11): the proxy worker (nls-proxy.service)
+# runs in the host root netns. Per-tenant listener fds are created by
+# the priv helper (nls-proxy-priv.service) via setns() into the tenant
+# netns and passed back over SCM_RIGHTS, so the listening socket lives
+# in the tenant netns but the worker code reading/writing it runs in
+# host root. Practical consequence: there is NO proxy process visible
+# inside `ip netns pids localsvc-<net>`. The shared admin endpoint on
+# the host is what introspects "is the proxy serving network X?".
 
 CASE_ID="07-multitenant-isolation"
 CASE_TITLE="multi-tenant (2 networks) + mixed-plugin (nat + proxy on one ns)"
 LAB_TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/case.sh
 . "${LAB_TESTS_DIR}/lib/case.sh"
-
-# Mirrors the original early-return in run-on-lab.sh:1213. envoy
-# assertions are gone now that proxy replaced envoy; nat-side coverage
-# will move into the follow-up. Skip cleanly so the case is visible in
-# summaries but doesn't pollute pass/fail counts.
-skip "envoy → proxy follow-up: nat+proxy mixed-plugin coverage not yet ported"
-
-# --- Below is the original test body, kept for reference. ---------------
-# When the (nat + proxy) mixed-plugin replacement lands, remove the
-# `skip` above and rewire this section to use proxy where it currently
-# uses envoy.
 
 SVC_A_LVS_ID=""
 SVC_A_ENVOY_ID=""
@@ -104,8 +98,9 @@ if [[ -z "$NS_A_IP" ]]; then
 fi
 m8_spawn_tcp_backend "$NS_A_NAME" "$NS_A_IP" "$M10_SVC_A_LVS_BACKEND_PORT"
 
-# Envoy backends live in the host root netns (host-side proxy worker
-# pattern). Distinct ports so we can tell them apart in logs.
+# Proxy backends live in the host root netns: the proxy worker dials
+# them from host root, not from the tenant netns. Distinct ports so we
+# can tell them apart in logs.
 sudo bash -c "cd /tmp && python3 -m http.server $M10_SVC_A_ENVOY_BACKEND_PORT --bind 127.0.0.2" \
     >/tmp/m10-backend.${M10_SVC_A_ENVOY_BACKEND_PORT}.log 2>&1 &
 echo "$!" | sudo tee /tmp/m10-backend.${M10_SVC_A_ENVOY_BACKEND_PORT}.pid >/dev/null
@@ -135,7 +130,7 @@ if [[ -z "$SVC_B_ENVOY_ID" ]]; then
 fi
 if [[ -z "$SVC_A_LVS_ID" || -z "$SVC_A_ENVOY_ID" || -z "$SVC_B_ENVOY_ID" ]]; then
     fail "could not create one of the multitenant services" \
-         "lvs_a=$SVC_A_LVS_ID envoy_a=$SVC_A_ENVOY_ID envoy_b=$SVC_B_ENVOY_ID"
+         "lvs_a=$SVC_A_LVS_ID proxy_a=$SVC_A_ENVOY_ID proxy_b=$SVC_B_ENVOY_ID"
     exit 0
 fi
 
@@ -143,10 +138,10 @@ BE_A_LVS=$(_curl POST "/v2.0/local_service_backends" \
     "{\"local_service_backend\": {\"name\":\"be-m10-a-lvs\",\"service_id\":\"$SVC_A_LVS_ID\",\"address\":\"$NS_A_IP\",\"port\":$M10_SVC_A_LVS_BACKEND_PORT}}" \
     | _jget "['local_service_backend']['id']" 2>/dev/null || true)
 BE_A_ENVOY=$(_curl POST "/v2.0/local_service_backends" \
-    "{\"local_service_backend\": {\"name\":\"be-m10-a-envoy\",\"service_id\":\"$SVC_A_ENVOY_ID\",\"address\":\"127.0.0.2\",\"port\":$M10_SVC_A_ENVOY_BACKEND_PORT}}" \
+    "{\"local_service_backend\": {\"name\":\"be-m10-a-proxy\",\"service_id\":\"$SVC_A_ENVOY_ID\",\"address\":\"127.0.0.2\",\"port\":$M10_SVC_A_ENVOY_BACKEND_PORT}}" \
     | _jget "['local_service_backend']['id']" 2>/dev/null || true)
 BE_B_ENVOY=$(_curl POST "/v2.0/local_service_backends" \
-    "{\"local_service_backend\": {\"name\":\"be-m10-b-envoy\",\"service_id\":\"$SVC_B_ENVOY_ID\",\"address\":\"127.0.0.2\",\"port\":$M10_SVC_B_ENVOY_BACKEND_PORT}}" \
+    "{\"local_service_backend\": {\"name\":\"be-m10-b-proxy\",\"service_id\":\"$SVC_B_ENVOY_ID\",\"address\":\"127.0.0.2\",\"port\":$M10_SVC_B_ENVOY_BACKEND_PORT}}" \
     | _jget "['local_service_backend']['id']" 2>/dev/null || true)
 
 BIND_A_LVS=$(setup_binding "$SVC_A_LVS_ID" "$NET_ID")
@@ -154,9 +149,9 @@ BIND_A_ENVOY=$(setup_binding "$SVC_A_ENVOY_ID" "$NET_ID")
 BIND_B_ENVOY=$(setup_binding "$SVC_B_ENVOY_ID" "$NET_B_ID")
 
 # Reconciler runs every 10s; PB events kick it within a tick. Allow
-# extra slack here because we're spawning keepalived AND two tenant
-# envoys back-to-back, plus the one-time host-envoy reload as the
-# catalog grows from {} to {3 services}.
+# extra slack here because we're spawning keepalived in netns A AND
+# wiring two proxy listeners (one per network) plus the catalog reload
+# that picks up all three services.
 sleep 18
 
 # ---- Both netns exist --------------------------------------------------
@@ -171,57 +166,62 @@ else
     fail "netns B missing — agent did not provision on first bind"
 fi
 
-# ---- Mixed-plugin: keepalived AND tenant envoy both run in netns A
+# ---- Mixed-plugin: keepalived in netns A (LVS still runs in-netns) ----
+# The proxy worker is host-root, so there is NO proxy process inside
+# the tenant netns; mixed-plugin proof comes from the proxy /clusters
+# poll below plus the data-path checks at the end.
 KA_IN_A=0
-ENVOY_IN_A=0
-ENVOY_IN_B=0
 for pid in $(sudo ip netns pids "$NS_A_NAME" 2>/dev/null); do
     comm=$(sudo cat "/proc/${pid}/comm" 2>/dev/null || true)
-    case "$comm" in
-        keepalived) KA_IN_A=1 ;;
-        envoy)      ENVOY_IN_A=1 ;;
-    esac
-done
-for pid in $(sudo ip netns pids "$NS_B_NAME" 2>/dev/null); do
-    comm=$(sudo cat "/proc/${pid}/comm" 2>/dev/null || true)
-    if [[ "$comm" == "envoy" ]]; then ENVOY_IN_B=1; fi
+    if [[ "$comm" == "keepalived" ]]; then KA_IN_A=1; fi
 done
 if [[ "$KA_IN_A" -eq 1 ]]; then
-    pass "keepalived running in netns A (LVS plugin)"
+    pass "keepalived running in netns A (nat/LVS plugin)"
 else
     fail "no keepalived process in netns A"
 fi
-if [[ "$ENVOY_IN_A" -eq 1 ]]; then
-    pass "tenant envoy running in netns A alongside keepalived (mixed-plugin)"
+
+# ---- Shared host proxy: BOTH services served by the one worker --------
+# Replaces the old M9_HOST_DIR/envoy.pid + M9_HOST_ADMIN_SOCK probes:
+# proxy is two systemd units (priv + worker) and a token-gated admin
+# socket. No sudo — runner is `stack`, which owns the token (mode 0400)
+# and matches the worker's effective uid for the admin socket peer-uid
+# gate (proxy/worker/src/admin.rs:97).
+if systemctl is-active --quiet nls-proxy-priv.service \
+   && systemctl is-active --quiet nls-proxy.service; then
+    pass "nls-proxy-priv.service and nls-proxy.service both active"
 else
-    fail "no tenant envoy in netns A"
-fi
-if [[ "$ENVOY_IN_B" -eq 1 ]]; then
-    pass "tenant envoy running in netns B"
-else
-    fail "no tenant envoy in netns B"
+    fail "one of the nls-proxy units is not active" \
+         "priv=$(systemctl is-active nls-proxy-priv.service 2>/dev/null) worker=$(systemctl is-active nls-proxy.service 2>/dev/null)"
 fi
 
-# ---- Shared host envoy: ONE process for both networks ------------------
-HOST_PID=""
-if [[ -f "${M9_HOST_DIR:-}/envoy.pid" ]]; then
-    HOST_PID=$(sudo cat "${M9_HOST_DIR}/envoy.pid" 2>/dev/null || true)
-fi
-if [[ -n "$HOST_PID" ]] && sudo kill -0 "$HOST_PID" 2>/dev/null; then
-    pass "shared host envoy running (pid=$HOST_PID)"
+# Catalog union: the worker's /clusters lists BOTH tenant services.
+# Poll until both appear (catalog reload + first HC pass + listener
+# bind via priv helper take a few seconds end-to-end). Same poll-style
+# pattern as case 08.
+PROXY_ADMIN_SOCK="/var/run/neutron-local-services/_proxy/admin.sock"
+PROXY_ADMIN_TOKEN=$(cat /var/lib/neutron-local-services/_proxy/admin.token 2>/dev/null | tr -d '\n')
+WAIT=0
+WAIT_LIMIT=30
+CLUSTERS_JSON=""
+while [[ "$WAIT" -lt "$WAIT_LIMIT" ]]; do
+    CLUSTERS_JSON=$(curl -sS --max-time 3 \
+        --unix-socket "$PROXY_ADMIN_SOCK" \
+        -H "Authorization: Bearer ${PROXY_ADMIN_TOKEN}" \
+        "http://localhost/clusters?format=json" 2>&1 || true)
+    if echo "$CLUSTERS_JSON" | grep -q "$SVC_A_ENVOY_ID" \
+       && echo "$CLUSTERS_JSON" | grep -q "$SVC_B_ENVOY_ID"; then
+        break
+    fi
+    sleep 2
+    WAIT=$((WAIT+2))
+done
+if echo "$CLUSTERS_JSON" | grep -q "$SVC_A_ENVOY_ID" \
+   && echo "$CLUSTERS_JSON" | grep -q "$SVC_B_ENVOY_ID"; then
+    pass "proxy /clusters lists both networks' services (catalog union — mixed-plugin proven)"
 else
-    fail "shared host envoy not running"
-fi
-
-# Catalog isolation: host /clusters carries BOTH envoy services.
-CLUSTERS_JSON=$(sudo curl -sS --max-time 3 \
-    --unix-socket "${M9_HOST_ADMIN_SOCK:-}" \
-    "http://localhost/clusters?format=json" 2>&1 || true)
-if echo "$CLUSTERS_JSON" | grep -q "${SVC_A_ENVOY_ID}-tcp" \
-   && echo "$CLUSTERS_JSON" | grep -q "${SVC_B_ENVOY_ID}-tcp"; then
-    pass "host envoy /clusters lists both networks' envoy services (catalog union)"
-else
-    fail "host envoy /clusters missing one of the multitenant envoy clusters"
+    fail "proxy /clusters missing one of the multitenant proxy services" \
+         "got: $(echo "$CLUSTERS_JSON" | head -c 400)"
 fi
 
 # ---- Per-netns VIP isolation ------------------------------------------
@@ -232,7 +232,7 @@ ADDRS_B=$(sudo ip -n "$NS_B_NAME" addr show "$VETH_B_NS" 2>/dev/null | awk '/ine
 if echo "$ADDRS_A" | grep -q "${M10_SVC_A_LVS_VIP}/32" \
    && echo "$ADDRS_A" | grep -q "${M10_SVC_A_ENVOY_VIP}/32" \
    && ! echo "$ADDRS_A" | grep -q "${M10_SVC_B_ENVOY_VIP}/32"; then
-    pass "netns A has VIP_A_lvs + VIP_A_envoy, not VIP_B_envoy"
+    pass "netns A has VIP_A_lvs + VIP_A_proxy, not VIP_B_proxy"
 else
     fail "netns A VIP set wrong" \
          "addrs: $ADDRS_A"
@@ -240,7 +240,7 @@ fi
 if echo "$ADDRS_B" | grep -q "${M10_SVC_B_ENVOY_VIP}/32" \
    && ! echo "$ADDRS_B" | grep -q "${M10_SVC_A_LVS_VIP}/32" \
    && ! echo "$ADDRS_B" | grep -q "${M10_SVC_A_ENVOY_VIP}/32"; then
-    pass "netns B has VIP_B_envoy, not network-A VIPs"
+    pass "netns B has VIP_B_proxy, not network-A VIPs"
 else
     fail "netns B VIP set wrong" \
          "addrs: $ADDRS_B"
@@ -254,31 +254,31 @@ m10_test_client_setup "$NET_B_ID" "$M10_CLIENT_B_NS" \
     "$M10_CLIENT_B_VETH_ROOT" "$M10_CLIENT_B_VETH_NS" \
     "$M10_CLIENT_B_PORT_NAME" "b"
 
-# Client A → VIP A_lvs (LVS data path)
+# Client A → VIP A_lvs (nat/LVS data path)
 OUT=$(sudo ip netns exec "$M10_CLIENT_A_NS" \
     curl -sS --max-time 5 "http://$M10_SVC_A_LVS_VIP:$M10_SVC_A_LVS_PORT/" 2>&1 || true)
 if [[ "$OUT" == *"Directory listing"* ]]; then
-    pass "client A → VIP_A_lvs reaches backend (LVS path on netns A)"
+    pass "client A → VIP_A_lvs reaches backend (nat/LVS path on netns A)"
 else
     fail "client A → VIP_A_lvs failed" "out=$OUT"
 fi
 
-# Client A → VIP A_envoy (Envoy data path on same netns)
+# Client A → VIP A_proxy (proxy data path on same netns)
 OUT=$(sudo ip netns exec "$M10_CLIENT_A_NS" \
     curl -sS --max-time 5 "http://$M10_SVC_A_ENVOY_VIP:$M10_SVC_A_ENVOY_PORT/" 2>&1 || true)
 if [[ "$OUT" == *"Directory listing"* ]]; then
-    pass "client A → VIP_A_envoy reaches backend (envoy path on netns A — mixed-plugin proven)"
+    pass "client A → VIP_A_proxy reaches backend (proxy path on netns A — mixed-plugin proven)"
 else
-    fail "client A → VIP_A_envoy failed" "out=$OUT"
+    fail "client A → VIP_A_proxy failed" "out=$OUT"
 fi
 
-# Client B → VIP B_envoy
+# Client B → VIP B_proxy
 OUT=$(sudo ip netns exec "$M10_CLIENT_B_NS" \
     curl -sS --max-time 5 "http://$M10_SVC_B_ENVOY_VIP:$M10_SVC_B_ENVOY_PORT/" 2>&1 || true)
 if [[ "$OUT" == *"Directory listing"* ]]; then
-    pass "client B → VIP_B_envoy reaches backend (envoy path on netns B)"
+    pass "client B → VIP_B_proxy reaches backend (proxy path on netns B)"
 else
-    fail "client B → VIP_B_envoy failed" "out=$OUT"
+    fail "client B → VIP_B_proxy failed" "out=$OUT"
 fi
 
 # ---- Tenant isolation: cross-network traffic must FAIL ----------------
@@ -287,7 +287,7 @@ OUT=$(sudo ip netns exec "$M10_CLIENT_A_NS" \
 if [[ "$OUT" == *"Directory listing"* ]]; then
     fail "ISOLATION BREACH: client A reached network B's VIP" "out=$OUT"
 else
-    pass "isolation: client A cannot reach VIP_B_envoy (cross-tenant blocked)"
+    pass "isolation: client A cannot reach VIP_B_proxy (cross-tenant blocked)"
 fi
 
 OUT=$(sudo ip netns exec "$M10_CLIENT_B_NS" \
@@ -301,9 +301,9 @@ fi
 OUT=$(sudo ip netns exec "$M10_CLIENT_B_NS" \
     curl -sS --max-time 4 "http://$M10_SVC_A_ENVOY_VIP:$M10_SVC_A_ENVOY_PORT/" 2>&1 || true)
 if [[ "$OUT" == *"Directory listing"* ]]; then
-    fail "ISOLATION BREACH: client B reached network A's Envoy VIP" "out=$OUT"
+    fail "ISOLATION BREACH: client B reached network A's proxy VIP" "out=$OUT"
 else
-    pass "isolation: client B cannot reach VIP_A_envoy (cross-tenant blocked)"
+    pass "isolation: client B cannot reach VIP_A_proxy (cross-tenant blocked)"
 fi
 
 # Network B is left in place across runs (cheap to keep, lets re-runs
