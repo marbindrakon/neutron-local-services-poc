@@ -27,7 +27,7 @@
 //! other thread in the process) stays in the host netns for its
 //! lifetime.
 
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -415,6 +415,13 @@ fn bind_listener_in_current_netns(
     proto: nls_proxy_wire::Proto,
 ) -> Result<OwnedFd> {
     let addr = std::net::SocketAddr::new(vip, port);
+    if vip.is_ipv6() {
+        // IPV6_V6ONLY must be applied before bind() — once the socket
+        // has an inet_num the kernel returns EINVAL on attempts to
+        // change it. Build the socket by hand so the option is set in
+        // the right order, then hand the bound fd back as an OwnedFd.
+        return bind_ipv6_v6only(addr, proto);
+    }
     let fd: OwnedFd = match proto {
         nls_proxy_wire::Proto::Tcp => std::net::TcpListener::bind(addr)
             .with_context(|| format!("TCP bind {addr}"))?
@@ -423,9 +430,75 @@ fn bind_listener_in_current_netns(
             .with_context(|| format!("UDP bind {addr}"))?
             .into(),
     };
-    if vip.is_ipv6() {
-        // Force v6only so v4-mapped addresses don't sneak in.
-        set_ipv6_v6only(fd.as_raw_fd())?;
+    Ok(fd)
+}
+
+fn bind_ipv6_v6only(
+    addr: std::net::SocketAddr,
+    proto: nls_proxy_wire::Proto,
+) -> Result<OwnedFd> {
+    let v6 = match addr {
+        std::net::SocketAddr::V6(v6) => v6,
+        std::net::SocketAddr::V4(_) => bail!("bind_ipv6_v6only called with IPv4 addr {addr}"),
+    };
+    let sock_type = match proto {
+        nls_proxy_wire::Proto::Tcp => libc::SOCK_STREAM,
+        nls_proxy_wire::Proto::Udp => libc::SOCK_DGRAM,
+    };
+    // SAFETY: socket() with valid AF/type constants. Returns -1 on
+    // failure (handled below); on success we wrap the raw fd in an
+    // OwnedFd so it's closed on every error path.
+    let raw = unsafe {
+        libc::socket(libc::AF_INET6, sock_type | libc::SOCK_CLOEXEC, 0)
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket(AF_INET6)");
+    }
+    // SAFETY: raw is a fresh fd from socket() above.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_ipv6_v6only(fd.as_raw_fd())?;
+    if proto == nls_proxy_wire::Proto::Tcp {
+        // Match std::net::TcpListener::bind, which sets SO_REUSEADDR.
+        let on: libc::c_int = 1;
+        // SAFETY: valid fd, libc constants, stack-local int.
+        let r = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &on as *const _ as *const _,
+                std::mem::size_of_val(&on) as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error()).context("setsockopt SO_REUSEADDR");
+        }
+    }
+    let sin6 = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: v6.port().to_be(),
+        sin6_flowinfo: v6.flowinfo(),
+        sin6_addr: libc::in6_addr { s6_addr: v6.ip().octets() },
+        sin6_scope_id: v6.scope_id(),
+    };
+    // SAFETY: sin6 is fully initialized above; size matches the type.
+    let r = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &sin6 as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("bind {addr}"));
+    }
+    if proto == nls_proxy_wire::Proto::Tcp {
+        // 1024 mirrors std::net::TcpListener's default backlog on Linux.
+        // SAFETY: valid fd, backlog is a positive c_int.
+        let r = unsafe { libc::listen(fd.as_raw_fd(), 1024) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error()).context("listen");
+        }
     }
     Ok(fd)
 }
