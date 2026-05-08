@@ -88,6 +88,15 @@ Type=simple
 Restart=on-failure
 RestartSec=2
 
+# euid=root for setns + low-port bind, but egid=nls-admin so that
+# (a) systemd creates RuntimeDirectory below as ``root:nls-admin``,
+# closing a startup race against the worker (which depends on the
+# dir being group-writable by nls-admin); (b) sockets the worker
+# creates inside the dir inherit nls-admin via the setgid bit,
+# keeping them reachable by the agent (also nls-admin).
+User=root
+Group=nls-admin
+
 # Caps. setns + low-port bind cover the priv helper's spawn path.
 # CAP_CHOWN lets ExecStartPost chgrp the runtime dir below to
 # nls-admin so the worker (running as ${STACK_USER}, member of
@@ -106,11 +115,19 @@ PrivateTmp=yes
 RuntimeDirectory=neutron-local-services/_proxy
 RuntimeDirectoryMode=2770
 RuntimeDirectoryPreserve=yes
-# RuntimeDirectory= always (re)creates the dir as root:root, so
-# chgrp it to nls-admin every start. Mode 2770 + setgid means
-# sockets the worker creates inside inherit the group, keeping
-# admin/control sockets reachable by the agent (also nls-admin).
+# Belt-and-suspenders chgrp. Group= above already makes systemd
+# create the dir as nls-admin; this ExecStartPost is a no-op on
+# steady-state but recovers if the unit was re-applied without
+# Group= set (older revisions of this script).
 ExecStartPost=/bin/chgrp nls-admin /run/neutron-local-services/_proxy
+
+# Resource caps. The priv helper spawns one short-lived bind-helper
+# thread per BindListener and otherwise idles; these are generous
+# enough to never trip on a real chassis but bound the worst-case
+# blast radius from a runaway loop or a buggy peer.
+TasksMax=256
+LimitNOFILE=8192
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
@@ -157,6 +174,17 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/lib/neutron-local-services/_proxy /var/run/neutron-local-services/_proxy
+
+# Resource caps. The worker holds one tokio thread per tenant
+# netns plus a small static set (admin, hc, watchdog, control
+# accept). Real chassis deployments are O(100) tenants; these
+# caps sit ~10x above that to bound runaway behavior without
+# tripping on legitimate growth. Each TCP/UDP listener can hold
+# up to max_concurrent (default 1000) sockets, so LimitNOFILE
+# has to scale with listener count.
+TasksMax=4096
+LimitNOFILE=1048576
+MemoryMax=2G
 
 [Install]
 WantedBy=multi-user.target

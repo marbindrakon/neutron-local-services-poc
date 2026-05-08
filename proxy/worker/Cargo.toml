@@ -29,6 +29,8 @@ hyper-util = { workspace = true }
 tower = { workspace = true }
 notify = { workspace = true }
 hickory-proto = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

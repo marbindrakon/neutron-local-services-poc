@@ -23,6 +23,20 @@ from neutron_local_services.db import models
 LOG = logging.getLogger(__name__)
 
 
+def _ip_in_any_cidr(ip, cidrs):
+    for c in cidrs or ():
+        try:
+            net = netaddr.IPNetwork(c)
+        except (netaddr.AddrFormatError, ValueError):
+            LOG.warning('Skipping malformed CIDR in allowed_vip_cidrs: %r', c)
+            continue
+        if ip.version != net.version:
+            continue
+        if ip in net:
+            return True
+    return False
+
+
 class LocalServicesDbMixin:
     """Mixin providing DB CRUD for local services / backends / bindings."""
 
@@ -79,12 +93,27 @@ class LocalServicesDbMixin:
     def _validate_vip(addr):
         if addr is None:
             return
-        denylist = cfg.CONF[ls_conf.GROUP].vip_denylist
         try:
             ip = netaddr.IPAddress(addr)
         except (netaddr.AddrFormatError, ValueError):
             raise n_exc.InvalidInput(
                 error_message=f'invalid IP address: {addr}')
+        # Reject obvious junk before consulting operator config. The
+        # explicit `int(ip) == 0` catches ``0.0.0.0`` / ``::`` since
+        # netaddr's "unspecified" predicate isn't exposed uniformly
+        # across versions.
+        if int(ip) == 0 or ip.is_loopback() or ip.is_multicast() or \
+                ip.is_reserved() or ip.is_netmask() or ip.is_hostmask():
+            raise n_exc.InvalidInput(
+                error_message=f'VIP {addr} is not a valid unicast '
+                              'address')
+        allowed_cidrs = cfg.CONF[ls_conf.GROUP].allowed_vip_cidrs
+        if not _ip_in_any_cidr(ip, allowed_cidrs):
+            raise n_exc.InvalidInput(
+                error_message=f'VIP {addr} is not inside any '
+                              'allowed_vip_cidrs entry '
+                              f'({", ".join(allowed_cidrs)})')
+        denylist = cfg.CONF[ls_conf.GROUP].vip_denylist
         if str(ip) in denylist:
             raise n_exc.InvalidInput(
                 error_message=f'VIP {addr} is in the configured denylist')

@@ -38,6 +38,19 @@ AUTH_GROUP = 'local_services_agent'
 SERVICE_TYPE = 'network'
 
 
+class RegistryFetchError(Exception):
+    """Raised when desired-state fetch can't be completed.
+
+    Distinct from "the API answered with an empty result" — that is
+    *authoritative* state and reconciles to nothing. ``RegistryFetchError``
+    means the agent could not learn the desired state at all (Keystone
+    catalog miss, transport error, non-2xx response, partial fetch
+    where one of the dependent calls failed). Callers in the agent
+    extension catch this and preserve last-known-good state rather
+    than withdraw VIPs / listeners on transient blips.
+    """
+
+
 def register_opts(conf=cfg.CONF):
     """Register the keystoneauth1 auth + session opts for the agent.
 
@@ -56,9 +69,11 @@ class RegistryClient:
     the session can't be loaded until ``cfg.CONF`` has been parsed).
     Subsequent calls reuse the cached session.
 
-    Errors are swallowed and logged: a failed poll returns ``[]`` so
-    the reconciler can degrade to "no VIPs desired" rather than crash
-    the agent thread. The next pass picks up the real desired set.
+    On any fetch failure (Keystone catalog miss, transport exception,
+    non-2xx response, partial fan-out failure) the public methods raise
+    ``RegistryFetchError``. Callers must distinguish this from an
+    authoritative empty response and preserve last-known-good state on
+    the exception path.
     """
 
     def __init__(self, conf=cfg.CONF):
@@ -80,29 +95,37 @@ class RegistryClient:
                 self._endpoint = self._get_session().get_endpoint(
                     service_type=SERVICE_TYPE,
                     interface='public')
-            except ks_exc.EndpointNotFound:
+            except ks_exc.EndpointNotFound as e:
                 LOG.exception(
                     'No %s endpoint in keystone catalog; agent cannot '
-                    'reach the local-services API. VIP reconciliation '
-                    'will return empty until this is fixed.',
+                    'reach the local-services API.',
                     SERVICE_TYPE)
-                return None
+                raise RegistryFetchError(
+                    'No %s endpoint in keystone catalog' % SERVICE_TYPE
+                ) from e
         return self._endpoint
 
     def _get_json(self, path):
+        """Issue a GET and return the decoded JSON body.
+
+        Raises ``RegistryFetchError`` on Keystone-catalog miss,
+        transport exception, or non-200 response. Callers above
+        ``desired_state_for_network`` translate that into "preserve
+        last-known-good" behavior.
+        """
         endpoint = self._get_endpoint()
-        if not endpoint:
-            return None
         try:
             resp = self._get_session().get(endpoint + path,
                                            raise_exc=False)
-        except Exception:
+        except Exception as e:
             LOG.exception('Local-services API GET %s failed', path)
-            return None
+            raise RegistryFetchError(
+                'GET %s raised: %s' % (path, e)) from e
         if resp.status_code != 200:
             LOG.warning('Local-services API GET %s → %s: %s',
                         path, resp.status_code, resp.text[:200])
-            return None
+            raise RegistryFetchError(
+                'GET %s returned HTTP %s' % (path, resp.status_code))
         return resp.json()
 
     def desired_vips_for_network(self, network_id):
@@ -113,7 +136,9 @@ class RegistryClient:
         PoC is IPv4-only — see ``docs/limitations.md`` §1).
 
         Returns ``set[str]`` of CIDRs (e.g. ``{'169.254.169.5/32'}``).
-        On any error, returns an empty set and logs.
+        Raises ``RegistryFetchError`` on any fetch failure — the agent
+        extension catches that and reuses last-known-good rather than
+        withdraw VIPs.
 
         Implemented in terms of ``desired_state_for_network`` so the
         VIP path and the plugin path share one fetch.
@@ -141,17 +166,19 @@ class RegistryClient:
           ``enabled=False`` binding row exists for this network.
 
         Disabled services are filtered out — the operator quiesced them.
-        Returns ``[]`` on any error so the agent reconciler can log and
-        move on rather than crash. Per-service errors are partial: the
-        services that did fetch successfully still appear in the list.
+
+        Raises ``RegistryFetchError`` if any of the fetches needed to
+        compose the answer fail (bindings list, opt-out catalog query,
+        per-service GET, or backends GET). The agent extension treats
+        that as "transient — reuse last-known-good" rather than
+        synthesizing a partial answer that would withdraw VIPs the
+        plugin still considers desired.
         """
         # Fetch ALL bindings for this network. Both states matter: enabled
         # rows are inclusions; disabled rows are opt-out markers.
         bindings_resp = self._get_json(
             '/v2.0/local_service_bindings?network_id=%s' % network_id)
-        bindings = []
-        if bindings_resp:
-            bindings = bindings_resp.get('local_service_bindings') or []
+        bindings = bindings_resp.get('local_service_bindings') or []
 
         enabled_svc_ids = {b['service_id'] for b in bindings
                            if b.get('service_id')
@@ -163,7 +190,9 @@ class RegistryClient:
         services = []
         seen = set()
 
-        # Explicit attachments: fetch each by id.
+        # Explicit attachments: fetch each by id. A failure here raises
+        # — we don't want a transient 500 on one service to look like a
+        # "withdraw it" signal.
         for sid in enabled_svc_ids:
             svc = self._fetch_service(sid)
             if svc and sid not in seen:
@@ -175,9 +204,7 @@ class RegistryClient:
         opt_out_resp = self._get_json(
             '/v2.0/local_services'
             '?attachment_policy=opt-out&enabled=True')
-        opt_out = []
-        if opt_out_resp:
-            opt_out = opt_out_resp.get('local_services') or []
+        opt_out = opt_out_resp.get('local_services') or []
         for svc in opt_out:
             sid = svc.get('id')
             if not sid or sid in seen or sid in excluded_svc_ids:
@@ -191,11 +218,17 @@ class RegistryClient:
         return services
 
     def _fetch_service(self, service_id):
-        """Fetch a single service + its enabled backends. None on error
-        or if the service is operator-disabled."""
+        """Fetch a single service + its enabled backends.
+
+        Returns ``None`` only if the service is operator-disabled.
+        Raises ``RegistryFetchError`` on transport/HTTP failure — a
+        404 / 500 here is *not* the same as "the service was deleted":
+        the binding list said the service was attached, so an empty
+        answer would be inconsistent with what we just read. The next
+        reconcile pass will see a consistent (binding-list, service)
+        view either way.
+        """
         svc_resp = self._get_json('/v2.0/local_services/%s' % service_id)
-        if not svc_resp:
-            return None
         svc = svc_resp.get('local_service') or {}
         if not svc.get('enabled', True):
             return None
@@ -203,11 +236,13 @@ class RegistryClient:
         return svc
 
     def _fetch_backends(self, service_id):
-        """List enabled backends for one service. Empty list on error."""
+        """List enabled backends for one service.
+
+        Raises ``RegistryFetchError`` on transport/HTTP failure. An
+        authoritative empty list still returns ``[]``.
+        """
         resp = self._get_json(
             '/v2.0/local_service_backends?service_id=%s&enabled=True'
             % service_id)
-        if not resp:
-            return []
         return [b for b in (resp.get('local_service_backends') or [])
                 if b.get('enabled', True)]

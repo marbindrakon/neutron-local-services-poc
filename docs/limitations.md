@@ -135,7 +135,7 @@ through different mechanisms:
   `localsvc-<network>` netns, which has only its on-subnet route by
   default (e.g. `10.0.0.0/26 dev tls...`). The agent therefore
   provisions a per-network underlay-egress veth pair (host-root-side
-  `nlsu<net>0`, ns-side `nlsu<net>1`) over a /30 from a configurable
+  `nls<net>0`, ns-side `nls<net>1`) over a /30 from a configurable
   RFC6598 pool (default `100.64.0.0/22`), installs a default route in
   the netns via the host-side IP, and SNATs the netns CIDR to the
   chassis's egress IP via `iptables -t nat POSTROUTING`. The new veth
@@ -158,7 +158,7 @@ agent installs four protections:
    `health_check_address`/`health_check_port` overrides. Default DROP
    at the chain tail. Refreshed on every catalog change. This is the
    primary tenant-escape gate.
-3. **Inter-tenant DROP** (`-i nlsu+ -o nlsu+ -j DROP`) blocks one
+3. **Inter-tenant DROP** (`-i nls+ -o nls+ -j DROP`) blocks one
    tenant from cross-talking another tenant's underlay path.
 4. **rp_filter = 1** on both ends of the new veth prevents source-IP
    spoofing.
@@ -240,7 +240,7 @@ chassis, multiple agent restarts in a row, etc.
 **Not in v1.** Health checking is delegated to the exposure plugin —
 Keepalived's TCP_CHECK / HTTP_GET / SSL_GET / MISC_CHECK in the
 `nat` plugin, the proxy worker's built-in HC engine
-(`tcp_connect` / `http_get` / `https_handshake` / `udp_dns_query` /
+(`tcp_connect` / `http_get` / `https_get` / `udp_dns_query` /
 `script`) in the `proxy` plugin. The agent does not run a Python
 health-check probe.
 
@@ -345,7 +345,7 @@ is not implemented and would require RBAC depth not yet present (see
 | IPv6 data path                  | model + API done; chassis-side v4-only | medium (DHCPv6/RA + plugin v6) |
 | Availability zones              | not implemented             | small (additive filter)     |
 | RBAC                            | admin-mutate / read-anyone  | large (RBAC table + checks) |
-| Underlay backends (nat plugin)  | works via per-tenant `nlsu` veth + per-backend ACL | small (tighter ACL options) |
+| Underlay backends (nat plugin)  | works via per-tenant `nls` veth + per-backend ACL | small (tighter ACL options) |
 | Underlay backends (proxy plugin)| works (worker in host netns)| n/a                         |
 | Multi-chassis (verified)        | 5-node lab; tests green     | n/a                         |
 | Health-check API surface        | plugin-internal only        | small (parse + expose)      |

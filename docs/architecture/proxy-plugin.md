@@ -193,8 +193,11 @@ all tenants. Probe types:
 
 - `tcp_connect` — connect within `timeout_s`.
 - `http_get` — status code match against `health_check_config`.
-- `https_handshake` — TLS handshake (no cert verification by
-  default).
+- `https_get` — TLS connect + HTTP GET, status-code match. Mirrors the
+  `nat` plugin's keepalived `SSL_GET`. Cert verification is skipped
+  (matches keepalived's default) so self-signed and internal-CA
+  backends work without operator-supplied trust anchors. SNI is
+  optional via the `sni` field.
 - `udp_dns_query` — built-in DNS A query for a configurable name.
 - `script` — runs Keepalived `MISC_CHECK`-compatible scripts. Reuses
   the same `agent/plugins/check_scripts/` directory the `nat`
@@ -239,10 +242,14 @@ semantics.
 
 `nls-proxy-wire` defines the JSON RPC message types:
 
-- `OpenNetns(name) → fd`
-- `BindListener(netns_fd, vip, port, proto) → listener_fd`
-- `AddNetns(net_id, fd)` (agent → worker)
-- `CloseNetns(fd)` (agent → worker)
+- `BindListener(net_id, vip, port, proto) + netns_fd → listener_fd`
+  (priv ↔ worker; priv consults the agent-signed catalog and refuses
+  any `(net_id, vip, port, proto)` that isn't an entry, then verifies
+  the catalog's nonce inside the tenant netns before binding)
+- `AddNetns(net_id) + netns_fd` (agent → worker; the agent opens
+  `/run/netns/<localsvc-net_id>` directly — the priv helper is no
+  longer in this path)
+- `RemoveNetns(net_id)` (agent → worker)
 
 ## Failure modes
 

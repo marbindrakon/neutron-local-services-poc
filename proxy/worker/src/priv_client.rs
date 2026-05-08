@@ -20,8 +20,7 @@ use nls_proxy_wire::{Proto, Request, Response, MAX_FRAME_BYTES};
 pub fn bind_listener(
     socket_path: &Path,
     netns_fd: BorrowedFd<'_>,
-    nonce: &str,
-    nonce_path: &str,
+    net_id: &str,
     vip: IpAddr,
     port: u16,
     proto: Proto,
@@ -29,8 +28,7 @@ pub fn bind_listener(
     let stream = UnixStream::connect(socket_path)
         .with_context(|| format!("connect priv helper at {}", socket_path.display()))?;
     let req = Request::BindListener {
-        nonce: nonce.to_owned(),
-        nonce_path: nonce_path.to_owned(),
+        net_id: net_id.to_owned(),
         vip,
         port,
         proto,
@@ -42,7 +40,6 @@ pub fn bind_listener(
             .pop()
             .ok_or_else(|| anyhow!("priv helper returned BoundListener with no fd")),
         Response::Error { msg } => bail!("priv helper: {}", msg),
-        Response::OpenedNetns => bail!("priv helper returned wrong response variant: OpenedNetns"),
     }
 }
 

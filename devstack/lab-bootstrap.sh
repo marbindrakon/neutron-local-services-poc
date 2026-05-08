@@ -29,6 +29,14 @@ dnf config-manager --add-repo \
     https://trunk.rdoproject.org/centos10-master/delorean-deps.repo
 dnf install -y git python3-pip jq
 
+# `wheel` in the *system* pip lets ``pip install -e .
+# --no-build-isolation`` succeed for the PoC (pbr-based packages
+# need ``bdist_wheel`` available). Build-isolated installs already
+# pick wheel up via pyproject.toml's [build-system].requires, but
+# the iterative re-install flow (after rsync) typically uses
+# --no-build-isolation, which sees only system packages.
+python3 -m pip install --upgrade wheel
+
 # kernel-modules-extra ships xt_MASQUERADE, needed by DevStack's
 # `iptables -t nat -A POSTROUTING ... -j MASQUERADE` calls. The base
 # image's running kernel may not have a matching modules-extra; if a
@@ -53,11 +61,22 @@ chmod 0440 /etc/sudoers.d/stack
 chown -R stack:stack /opt/stack
 
 # Stack home + clones.
+#
+# `git checkout` only runs on a *fresh* clone — re-runs of bootstrap
+# (typical iterative flow: dev-side rsync followed by lab-push) leave
+# the working tree alone. Otherwise the checkout would refuse with
+# "local changes would be overwritten" the moment the rsynced tree
+# diverged from REPO_REF, breaking every push that touches a tracked
+# file. The rsync from lab-push.sh is the source of truth for the
+# code; bootstrap only needs to ensure the tree exists.
 sudo -u stack -H bash -euxo pipefail <<EOSU
 cd /opt/stack
 [[ -d devstack ]] || git clone -b "${DEVSTACK_BRANCH}" https://opendev.org/openstack/devstack
-[[ -d neutron-local-services ]] || git clone "${REPO_URL}" neutron-local-services
-cd neutron-local-services && git checkout "${REPO_REF}"
+if [[ ! -d neutron-local-services ]]; then
+    git clone "${REPO_URL}" neutron-local-services
+    cd neutron-local-services
+    git checkout "${REPO_REF}"
+fi
 EOSU
 
 # Drop in a local.conf if absent (we ship a sample with the repo).

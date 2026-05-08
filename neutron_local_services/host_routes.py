@@ -25,6 +25,8 @@ BEFORE_* events fire just-before the precommit DB writer and the
 See ``docs/architecture/overview.md`` for the wider design rationale.
 """
 
+import netaddr
+from neutron_lib import exceptions as n_exc
 from neutron_lib.callbacks import events
 from neutron_lib.callbacks import registry
 from neutron_lib.callbacks import resources
@@ -35,6 +37,18 @@ from neutron_local_services.ovn import localport as lp
 
 
 LOG = logging.getLogger(__name__)
+
+
+class SubnetOverlapsServiceVIPError(n_exc.BadRequest):
+    """Subnet CIDR would cover the VIP of a service attached to its network."""
+    message = (
+        'subnet CIDR %(cidr)s on network %(network_id)s would cover '
+        'VIP %(vip)s of attached service %(service_id)s. The '
+        'host_routes injector publishes a /32 for the VIP via the '
+        'localport, which would steer tenant traffic for that '
+        'address through the operator service. Pick a subnet CIDR '
+        'that does not contain any attached service VIP, or detach '
+        'the service from this network first.')
 
 
 def _localport_ipv4_in_subnet(port, subnet):
@@ -63,6 +77,13 @@ def compute_service_routes(core_plugin, context, subnet, services):
     this subnet (or None if the localport doesn't have an IP here, in
     which case ``routes`` is empty). Callers need ``nexthop`` to
     identify previously-injected routes for cleanup — see ``merge``.
+
+    Defense-in-depth: a VIP that lies inside this subnet's CIDR is
+    silently dropped (with an INFO log) rather than published. The
+    binding-time and subnet-time guards refuse explicit operator
+    actions that would create such an overlap, but for cloud-wide
+    opt-out services or pre-existing data we filter rather than fail
+    so an unrelated subnet add can't wedge the periodic reconciler.
     """
     network_id = subnet['network_id']
     port = lp.find_port(core_plugin, context, network_id)
@@ -71,6 +92,13 @@ def compute_service_routes(core_plugin, context, subnet, services):
     nexthop = _localport_ipv4_in_subnet(port, subnet)
     if nexthop is None:
         return [], None
+    cidr = subnet.get('cidr')
+    subnet_net = None
+    if cidr:
+        try:
+            subnet_net = netaddr.IPNetwork(cidr)
+        except (netaddr.AddrFormatError, ValueError):
+            subnet_net = None
     routes = []
     for svc in services:
         # PoC is IPv4-only (see docs/limitations.md §1). IPv6 RA Route Information
@@ -78,6 +106,20 @@ def compute_service_routes(core_plugin, context, subnet, services):
         vip = svc.get('local_ipv4')
         if not vip or not svc.get('enabled', True):
             continue
+        if subnet_net is not None:
+            try:
+                vip_ip = netaddr.IPAddress(vip)
+            except (netaddr.AddrFormatError, ValueError):
+                continue
+            if vip_ip.version == subnet_net.version and vip_ip in subnet_net:
+                LOG.info(
+                    'Skipping host_route for service %s VIP %s in '
+                    'subnet %s (cidr %s on network %s): VIP overlaps '
+                    'subnet CIDR — publishing the /32 would steer '
+                    'tenant traffic for an on-link address through '
+                    'the localport.',
+                    svc.get('id'), vip, subnet.get('id'), cidr, network_id)
+                continue
         routes.append(_service_route(vip, nexthop))
     return routes, nexthop
 
@@ -162,6 +204,8 @@ class HostRoutesHandler:
         subnet_data = states[0]
         if not isinstance(subnet_data, dict):
             return
+        self._refuse_overlap_with_attached_vips(
+            payload.context, subnet_data, subnet_data)
         self._inject(payload.context, subnet_data, subnet_data)
 
     def _on_before_update(self, resource, event, trigger, payload):
@@ -174,6 +218,13 @@ class HostRoutesHandler:
         orig, patch = states[0], states[1]
         if not isinstance(patch, dict):
             return
+        # CIDR is technically immutable on Neutron subnets, but check
+        # patch first defensively in case a future plugin ever allows
+        # it. If only host_routes are being touched, fall through to
+        # the host_routes merge below — no overlap check needed.
+        if 'cidr' in patch:
+            self._refuse_overlap_with_attached_vips(
+                payload.context, orig, patch)
         # If the tenant didn't touch host_routes at all, the existing
         # value (which already has our routes) is preserved by the IPAM
         # update path. No-op.
@@ -181,6 +232,66 @@ class HostRoutesHandler:
             return
         # network_id never changes on a subnet update, so read from orig.
         self._inject(payload.context, orig, patch)
+
+    def _refuse_overlap_with_attached_vips(self, context, lookup, target):
+        """Refuse a subnet whose CIDR would cover an *explicitly bound*
+        service's VIP. Implicit opt-out attachments only produce an
+        INFO log — `compute_service_routes` will drop the conflicting
+        per-subnet route on its own, so the subnet operation can
+        proceed.
+        """
+        network_id = lookup.get('network_id')
+        cidr = target.get('cidr') or lookup.get('cidr')
+        if not network_id or not cidr:
+            return
+        try:
+            net = netaddr.IPNetwork(cidr)
+        except (netaddr.AddrFormatError, ValueError):
+            # Let neutron's own validators reject malformed CIDRs.
+            return
+        # Service IDs explicitly bound (with enabled=True) to this
+        # network. Anything else effective came in via opt-out
+        # implicit attachment.
+        try:
+            bindings = self._plugin.get_local_service_bindings(
+                context, filters={'network_id': [network_id],
+                                  'enabled': [True]})
+        except Exception:
+            LOG.exception(
+                'Failed to fetch bindings for network %s during subnet '
+                'overlap check; allowing the subnet op to proceed and '
+                'relying on the per-subnet route filter for safety',
+                network_id)
+            bindings = []
+        explicit_svc_ids = {b.get('service_id') for b in bindings}
+        services = _enabled_services_for_network(
+            self._plugin, context, network_id)
+        for svc in services:
+            for k in ('local_ipv4', 'local_ipv6'):
+                v = svc.get(k)
+                if not v:
+                    continue
+                try:
+                    vip = netaddr.IPAddress(v)
+                except (netaddr.AddrFormatError, ValueError):
+                    continue
+                if vip.version != net.version or vip not in net:
+                    continue
+                sid = svc.get('id')
+                if sid in explicit_svc_ids:
+                    raise SubnetOverlapsServiceVIPError(
+                        cidr=cidr,
+                        network_id=network_id,
+                        vip=str(vip),
+                        service_id=sid)
+                LOG.info(
+                    'Subnet %s with cidr %s on network %s overlaps VIP '
+                    '%s of opt-out service %s; the service is '
+                    'implicitly attached, so the conflicting per-'
+                    'subnet route will be skipped instead of refusing '
+                    'the subnet operation.',
+                    target.get('id') or lookup.get('id'),
+                    cidr, network_id, str(vip), sid)
 
     # ----- shared injection logic -----
 
@@ -205,9 +316,17 @@ class HostRoutesHandler:
         # binding; the binding's localport sits in *another* subnet of
         # the same network and our nexthop computation correctly
         # returns None for the new subnet.
+        #
+        # ``cidr`` must be carried through so compute_service_routes can
+        # apply its overlap filter. Without it, an opt-out service whose
+        # VIP overlaps this subnet (allowed past the BEFORE_UPDATE
+        # overlap check on the assumption the per-route filter would
+        # catch it) would still get injected as a /32, hijacking
+        # tenant traffic for that on-link address.
         subnet_dict = {
             'id': subnet_for_lookup.get('id') or target.get('id'),
             'network_id': network_id,
+            'cidr': target.get('cidr') or subnet_for_lookup.get('cidr'),
         }
         services = _enabled_services_for_network(
             self._plugin, context, network_id)

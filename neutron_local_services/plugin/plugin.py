@@ -10,6 +10,7 @@ Wires together:
   create/update (via `neutron_local_services.host_routes`).
 """
 
+import netaddr
 from neutron_lib import context as n_context
 from neutron_lib import exceptions as n_exc
 from neutron_lib.plugins import directory
@@ -33,6 +34,17 @@ class OctaviaConflictError(n_exc.NeutronException):
         'neutron-local-services PoC cannot run alongside '
         'ovn-octavia-provider due to device_owner conflicts on '
         'LB-HM ports. See docs/limitations.md.')
+
+
+class VIPOverlapsSubnetError(n_exc.BadRequest):
+    """Refuse to attach a service whose VIP would hijack tenant routing."""
+    message = (
+        'service %(service_id)s VIP %(vip)s lies inside subnet '
+        '%(subnet_id)s CIDR %(cidr)s on network %(network_id)s. The '
+        'host_routes injector would publish a /32 for the VIP via '
+        'the localport, which would override the tenant\'s on-link '
+        'route to that address. Pick a VIP outside every subnet on '
+        'the target network or remove the conflicting subnet.')
 
 
 class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
@@ -297,9 +309,106 @@ class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
                     'Failed to update host_routes on subnet %s '
                     '(network %s) during refresh', subnet['id'], network_id)
 
+    # ----- service lifecycle wrappers -----
+
+    def update_local_service(self, context, id_, local_service):
+        body = local_service[lsc.RESOURCE_LOCAL_SERVICE]
+        if 'local_ipv4' in body or 'local_ipv6' in body:
+            # The VIP is changing. Refuse if the new VIP would overlap
+            # any subnet on a network this service is explicitly bound
+            # to. Opt-out services can apply to networks with no
+            # binding row — those aren't checked here; the periodic
+            # reconciler will surface mismatches but won't actively
+            # roll back. This is a known gap for cloud-wide opt-out
+            # services and is documented in TODO.md.
+            new_v4 = body.get('local_ipv4', None)
+            new_v6 = body.get('local_ipv6', None)
+            existing = self.get_local_service(context, id_)
+            candidate_v4 = new_v4 if 'local_ipv4' in body \
+                else existing.get('local_ipv4')
+            candidate_v6 = new_v6 if 'local_ipv6' in body \
+                else existing.get('local_ipv6')
+            candidates = [
+                netaddr.IPAddress(v) for v in (candidate_v4, candidate_v6)
+                if v]
+            if candidates:
+                bindings = self.get_local_service_bindings(
+                    context, filters={'service_id': [id_], 'enabled': [True]})
+                for b in bindings:
+                    self._refuse_vips_overlap_network(
+                        context, id_, candidates, b['network_id'])
+        return super().update_local_service(context, id_, local_service)
+
+    def _refuse_vips_overlap_network(self, context, service_id,
+                                     vips, network_id):
+        """Refuse if any of ``vips`` falls inside any subnet on ``network_id``."""
+        try:
+            subnets = self._core_plugin.get_subnets(
+                context, filters={'network_id': [network_id]})
+        except Exception:
+            LOG.exception(
+                'Failed to fetch subnets for network %s during VIP '
+                'overlap check; refusing to fail closed', network_id)
+            raise n_exc.ServiceUnavailable()
+        for subnet in subnets:
+            cidr = subnet.get('cidr')
+            if not cidr:
+                continue
+            try:
+                net = netaddr.IPNetwork(cidr)
+            except (netaddr.AddrFormatError, ValueError):
+                continue
+            for vip in vips:
+                if vip.version == net.version and vip in net:
+                    raise VIPOverlapsSubnetError(
+                        service_id=service_id,
+                        vip=str(vip),
+                        subnet_id=subnet.get('id'),
+                        cidr=cidr,
+                        network_id=network_id)
+
+    # ----- binding-time conflict checks -----
+
+    def _service_vips(self, svc):
+        """Return the (possibly empty) list of configured VIPs on a service."""
+        out = []
+        for k in ('local_ipv4', 'local_ipv6'):
+            v = svc.get(k)
+            if v:
+                out.append(netaddr.IPAddress(v))
+        return out
+
+    def _refuse_vip_subnet_overlap(self, context, service_id, network_id):
+        """Refuse if any VIP on ``service_id`` lies inside any subnet on
+        ``network_id``.
+
+        host_routes.merge() publishes a /32 for the VIP with the
+        localport as nexthop and lets that route win against tenant
+        host_routes (operator config beats tenant input). If the VIP
+        also sits on-link inside a tenant subnet, any tenant trying to
+        use that address inside its own subnet will be silently
+        steered through the localport. Refuse the binding before that
+        becomes a routing question.
+        """
+        try:
+            svc = self.get_local_service(context, service_id)
+        except Exception:
+            # Let the underlying create raise the proper NotFound.
+            return
+        vips = self._service_vips(svc)
+        if not vips:
+            return
+        self._refuse_vips_overlap_network(
+            context, service_id, vips, network_id)
+
     # ----- binding lifecycle wrappers -----
 
     def create_local_service_binding(self, context, local_service_binding):
+        body = local_service_binding[lsc.RESOURCE_LOCAL_SERVICE_BINDING]
+        # Conflict check fires BEFORE we write the binding row so a
+        # rejected binding leaves no DB trace.
+        self._refuse_vip_subnet_overlap(
+            context, body['service_id'], body['network_id'])
         result = super().create_local_service_binding(
             context, local_service_binding)
         try:
@@ -320,6 +429,15 @@ class LocalServicesPlugin(local_services_db.LocalServicesDbMixin,
 
     def update_local_service_binding(self, context, id_,
                                      local_service_binding):
+        body = local_service_binding[lsc.RESOURCE_LOCAL_SERVICE_BINDING]
+        # Re-check overlap when flipping enabled=True. A binding that
+        # was created when no overlapping subnet existed could later
+        # be re-enabled after a subnet was added; we still refuse to
+        # publish the route in that case.
+        if body.get('enabled') is True:
+            existing = self.get_local_service_binding(context, id_)
+            self._refuse_vip_subnet_overlap(
+                context, existing['service_id'], existing['network_id'])
         result = super().update_local_service_binding(
             context, id_, local_service_binding)
         # ``enabled`` may have flipped — reconcile so opt-out markers

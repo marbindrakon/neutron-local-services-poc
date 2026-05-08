@@ -65,7 +65,6 @@ ADMIN_TOKEN_PATH = os.path.join(PROXY_STATE_DIR, 'admin.token')
 NONCE_DIR = os.path.join(PROXY_STATE_DIR, 'nonces')
 
 PROXY_RUN_DIR = '/var/run/neutron-local-services/_proxy'
-PRIV_SOCKET = os.path.join(PROXY_RUN_DIR, 'priv.sock')
 CONTROL_SOCKET = os.path.join(PROXY_RUN_DIR, 'control.sock')
 ADMIN_SOCKET = os.path.join(PROXY_RUN_DIR, 'admin.sock')
 # Worker writes its boot-id (timestamp+pid) to this file at startup.
@@ -184,33 +183,17 @@ _LB_ALGO = {
                                     # weights emulate, see PLAN open Qs.
 }
 
-# HC type translation. The worker supports tcp_connect, http_get,
-# https_handshake, udp_dns_query, and `script`. The DNS / NTP cases
-# from the registry map to the script-based variant pointing at the
-# shipped check_scripts (literal Keepalived MISC_CHECK contract).
-_CHECK_SCRIPT_NAMES = {
-    lsc.HC_DNS: 'check_dns.sh',
-    lsc.HC_NTP: 'check_ntp.sh',
-}
-
-
-def _resolve_check_script(name):
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, 'check_scripts', name),
-        os.path.join('/usr/local/lib/neutron-local-services', name),
-        os.path.join('/usr/lib/neutron-local-services', name),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
+# HC type translation. The worker supports a closed set of native
+# probes: tcp_connect, http_get, https_get, udp_dns_query,
+# udp_ntp_query. There is intentionally no path-execution variant on
+# the wire — the API surface (HC_TYPES) and the catalog schema agree
+# on this set, so a tampered or buggy catalog cannot ask the worker
+# to fork-exec an attacker-named binary.
 
 
 def _hc_for_service(svc):
     """Translate the registry's HC fields into the worker's catalog
-    health_check object. Returns ``None`` if HC is disabled or
-    misconfigured (caller defaults to TCP connect)."""
+    health_check object."""
     hc_type = svc.get('health_check_type') or lsc.HC_NONE
     if hc_type == lsc.HC_NONE:
         return {'type': 'tcp_connect'}  # cheapest default
@@ -219,16 +202,15 @@ def _hc_for_service(svc):
     if hc_type == lsc.HC_HTTP:
         return {'type': 'http_get', 'path': '/'}
     if hc_type == lsc.HC_HTTPS:
-        return {'type': 'https_handshake'}
-    if hc_type in (lsc.HC_DNS, lsc.HC_NTP):
-        script = _resolve_check_script(_CHECK_SCRIPT_NAMES[hc_type])
-        if not script:
-            LOG.warning(
-                'health_check_type=%s but probe script %s not found '
-                'on disk; falling back to tcp_connect',
-                hc_type, _CHECK_SCRIPT_NAMES[hc_type])
-            return {'type': 'tcp_connect'}
-        return {'type': 'script', 'path': script}
+        # Mirrors the `nat` plugin's keepalived SSL_GET: real HTTPS
+        # GET / expecting 200. Worker skips cert verification (same as
+        # keepalived's SSL_GET default), so self-signed / internal-CA
+        # backends work out of the box.
+        return {'type': 'https_get', 'path': '/'}
+    if hc_type == lsc.HC_DNS:
+        return {'type': 'udp_dns_query'}
+    if hc_type == lsc.HC_NTP:
+        return {'type': 'udp_ntp_query'}
     return {'type': 'tcp_connect'}
 
 
@@ -352,70 +334,20 @@ def _recv_exactly(s, n):
     return bytes(out)
 
 
-def _open_netns_via_priv(network_id):
-    """Ask the priv helper for an fd referring to the tenant netns.
+def _open_tenant_netns_fd(network_id):
+    """Open the tenant netns and return an `O_RDONLY|O_CLOEXEC|O_NOFOLLOW`
+    fd (caller closes).
 
-    Returns the fd integer (caller closes). Reproduces the
-    ``OpenNetns`` request from the worker's RPC catalog.
-
-    Wire detail. The priv helper attaches the SCM_RIGHTS fd on its
-    first sendmsg, which carries the 4-byte length prefix. We MUST
-    recv the prefix via ``recvmsg`` with a cmsg buffer — using
-    plain ``recv()`` discards ancillary data and drops the fd on
-    the floor.
+    `/run/netns/<name>` is a bind-mount of `/proc/<pid>/ns/net` created by
+    `ip netns add`. The agent already owns the netns lifecycle (see
+    `agent/netns.py`), so it has the file-system access to open the fd
+    directly — there's no privilege the priv helper would add. Routing
+    netns opens through priv was a leftover from the original RPC
+    catalog and removed for the smaller attack surface.
     """
     netns_name = lsc.NETNS_PREFIX + network_id
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(PRIV_SOCKET)
-        req = json.dumps({'op': 'open_netns', 'name': netns_name}).encode()
-        s.sendall(struct.pack('>I', len(req)) + req)
-        # CMSG_SPACE gives the buffer-allocation size (header +
-        # alignment); CMSG_LEN is the payload portion only and is
-        # too small.
-        cmsg_buf_len = socket.CMSG_SPACE(struct.calcsize('i') * 4)
-        fds = []
-        # 4-byte length prefix — recvmsg, not recv, so we capture
-        # the SCM_RIGHTS that arrives with this same datagram-like
-        # delivery on a stream socket.
-        hdr = bytearray()
-        while len(hdr) < 4:
-            chunk, ancdata, _flags, _addr = s.recvmsg(
-                4 - len(hdr), cmsg_buf_len)
-            if not chunk:
-                raise IOError('eof from priv helper (length prefix)')
-            hdr.extend(chunk)
-            _drain_ancillary(ancdata, fds)
-        n = struct.unpack('>I', bytes(hdr))[0]
-        body = bytearray()
-        while len(body) < n:
-            chunk, ancdata, _flags, _addr = s.recvmsg(
-                n - len(body), cmsg_buf_len)
-            if not chunk:
-                raise IOError('eof from priv helper (body)')
-            body.extend(chunk)
-            _drain_ancillary(ancdata, fds)
-        resp = json.loads(bytes(body))
-        if resp.get('result') != 'opened_netns' or not fds:
-            for fd in fds:
-                os.close(fd)
-            raise RuntimeError('priv helper OpenNetns: %r (fds=%d)' % (resp, len(fds)))
-        primary = fds[0]
-        for fd in fds[1:]:
-            os.close(fd)
-        return primary
-    finally:
-        s.close()
-
-
-def _drain_ancillary(ancdata, fds_out):
-    int_size = struct.calcsize('i')
-    for level, ctype, data in ancdata:
-        if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
-            nfds = len(data) // int_size
-            if nfds:
-                fds_out.extend(struct.unpack('%di' % nfds,
-                                             data[:nfds * int_size]))
+    path = '/run/netns/' + netns_name
+    return os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
 
 
 # Cache of (network_id → True) for tenants we've already registered
@@ -461,7 +393,7 @@ def _ensure_registered(network_id):
         _check_worker_restart_locked()
         if network_id in _REGISTERED:
             return
-    fd = _open_netns_via_priv(network_id)
+    fd = _open_tenant_netns_fd(network_id)
     try:
         resp = _send_control_with_fd(
             {'op': 'add_netns', 'net_id': network_id}, fd)

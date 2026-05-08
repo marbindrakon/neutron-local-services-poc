@@ -75,11 +75,26 @@ DEFAULT_VIP_DENYLIST = (
     'fe80::a9fe:a9fe',  # OpenStack metadata IPv6
 )
 
+# Default allow-list of CIDRs from which VIPs MAY be allocated. Tighter
+# than the denylist on its own: the host_routes injector writes /32
+# routes into tenant subnets, so a VIP outside link-local would let an
+# operator-managed service silently override tenant routing for any
+# destination. Operators can override; we default to RFC3927/4291
+# link-local plus the IPv6 fe80::/10 link-local block. The metadata
+# IPs in DEFAULT_VIP_DENYLIST are still excluded after this allowlist
+# match.
+DEFAULT_ALLOWED_VIP_CIDRS = (
+    '169.254.0.0/16',  # IPv4 link-local
+    'fe80::/10',       # IPv6 link-local
+)
+
 # Underlay-egress veth pair (per network), distinct from the tenant-side
 # `tls<net[:10]>X` veth that lives on br-int. Linux IFNAMSIZ-1=15 char
-# budget: 4-char prefix + 9 net hex chars + 1 suffix = 14.
-UNDERLAY_VETH_PREFIX = 'nlsu'
-UNDERLAY_VETH_NET_LEN = 9
+# budget: 3-char prefix + 10 net hex chars + 1 suffix = 14. Matches
+# the upstream OVN metadata agent's 10-hex-char budget for `tap<...>`
+# (see neutron/agent/ovn/metadata/agent.py:_get_veth_name).
+UNDERLAY_VETH_PREFIX = 'nls'
+UNDERLAY_VETH_NET_LEN = 10
 
 # Default /30 pool for underlay-egress veth pairs. RFC6598 carrier-grade
 # NAT space — virtually never collides with operator private networks.
@@ -96,7 +111,9 @@ UNDERLAY_STATE_DIR = '/var/lib/neutron-local-services/_underlay'
 #   jump per managed network.
 # UNDERLAY_PER_NET_CHAIN_PREFIX: per-network sub-chain that whitelists
 #   (proto, dst, dport) tuples for the configured backend set. Reconciled
-#   on every catalog change. Suffix is the first 9 hex chars of the
-#   network UUID — fits ``NLS_UND_`` + 9 = 17 chars.
+#   on every catalog change. Suffix is the first ``UNDERLAY_VETH_NET_LEN``
+#   hex chars of the network UUID, matching the underlay veth so the
+#   chain ↔ veth correspondence is trivially derivable. ``NLS_UND_`` +
+#   10 = 18 chars, well under the 28-char limit.
 UNDERLAY_HOST_CHAIN = 'NEUTRON_LOCAL_SVC_UNDERLAY'
 UNDERLAY_PER_NET_CHAIN_PREFIX = 'NLS_UND_'

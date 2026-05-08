@@ -1,4 +1,4 @@
-//! Catalog schema, HMAC envelope, and validation.
+//! Catalog HMAC envelope, validation, and inotify-driven reload.
 //!
 //! On-disk format. The catalog is a single text file at
 //! `/var/lib/neutron-local-services/_proxy/catalog.json`, written by
@@ -15,6 +15,10 @@
 //! This split puts the HMAC outside the payload (no canonical-JSON
 //! gymnastics for agent or worker) and keeps the file plain enough
 //! to inspect with `head -1` / `tail -n +2`.
+//!
+//! The schema itself lives in `nls-proxy-wire::catalog` so the priv
+//! helper can deserialize the same bytes for its own BindListener
+//! authorization decisions.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -22,132 +26,36 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+
+pub use nls_proxy_wire::catalog::{
+    Backend, Catalog, Entry, HcCommon, HealthCheck, LbAlgo,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Catalog {
-    pub version: u32,
-    pub generation: u64,
-    pub entries: Vec<Entry>,
-}
+/// Worker-enforced upper bounds on catalog shape. The HMAC envelope
+/// guarantees integrity from casual tampering, but a buggy agent or
+/// a compromised signer could still produce a structurally valid but
+/// resource-exhausting catalog. These caps bound the worker's blast
+/// radius regardless: catalog reload fails closed (last-good
+/// snapshot stays in effect) and a metric increments. The numbers
+/// are picked to be ~100× larger than any plausible real chassis
+/// load so legitimate growth never trips them; if they ever do
+/// trip, that's a bug worth investigating, not a tuning problem.
+const MAX_ENTRIES: usize = 4096;
+const MAX_BACKENDS_PER_ENTRY: usize = 256;
+const MAX_TOTAL_BACKENDS: usize = 32_768;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entry {
-    pub net_id: String,
-    pub service_id: String,
-    pub nonce: String,
-    pub nonce_path: String,
-    pub vip: IpAddr,
-    pub port: u16,
-    pub proto: nls_proxy_wire::Proto,
-    pub backends: Vec<Backend>,
-    pub health_check: HealthCheck,
-    #[serde(default = "default_lb_algo")]
-    pub lb_algo: LbAlgo,
-    #[serde(default = "default_max_concurrent")]
-    pub max_concurrent: u32,
-    #[serde(default = "default_max_session_idle_s")]
-    pub max_session_idle_s: u32,
-}
-
-fn default_lb_algo() -> LbAlgo {
-    LbAlgo::Wrr
-}
-fn default_max_concurrent() -> u32 {
-    1000
-}
-fn default_max_session_idle_s() -> u32 {
-    60
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Backend {
-    pub addr: IpAddr,
-    pub port: u16,
-    #[serde(default = "default_weight")]
-    pub weight: u32,
-}
-
-fn default_weight() -> u32 {
-    1
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LbAlgo {
-    Wrr,
-    LeastConn,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum HealthCheck {
-    TcpConnect {
-        #[serde(flatten)]
-        common: HcCommon,
-    },
-    HttpGet {
-        #[serde(flatten)]
-        common: HcCommon,
-        path: String,
-        #[serde(default = "default_http_status")]
-        expect_status: u16,
-    },
-    HttpsHandshake {
-        #[serde(flatten)]
-        common: HcCommon,
-        #[serde(default)]
-        sni: Option<String>,
-    },
-    UdpDnsQuery {
-        #[serde(flatten)]
-        common: HcCommon,
-        #[serde(default = "default_dns_query")]
-        query: String,
-    },
-    Script {
-        #[serde(flatten)]
-        common: HcCommon,
-        path: String,
-        #[serde(default)]
-        args: Vec<String>,
-    },
-}
-
-fn default_http_status() -> u16 {
-    200
-}
-fn default_dns_query() -> String {
-    "health.invalid".into()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HcCommon {
-    #[serde(default = "default_interval")]
-    pub interval_s: u32,
-    #[serde(default = "default_timeout")]
-    pub timeout_s: u32,
-    #[serde(default = "default_fail_after")]
-    pub fail_after: u32,
-    #[serde(default = "default_rise_after")]
-    pub rise_after: u32,
-}
-
-fn default_interval() -> u32 {
-    5
-}
-fn default_timeout() -> u32 {
-    2
-}
-fn default_fail_after() -> u32 {
-    3
-}
-fn default_rise_after() -> u32 {
-    2
-}
+/// Health-check probes are spawned per backend, so an attacker-set
+/// 1-second interval times 32K backends would saturate the runtime.
+/// 1s is a fine floor for a real on-host check; nothing legitimate
+/// runs faster than that.
+const MIN_HC_INTERVAL_S: u32 = 1;
+/// HC timeout has to be smaller than the interval, but also can't be
+/// zero (which would make the probe's own deadline meaningless and
+/// busy-loop the runtime).
+const MIN_HC_TIMEOUT_S: u32 = 1;
 
 /// Spawn an inotify-driven watcher on the catalog directory.
 /// On every `IN_MOVED_TO` (atomic rename land) or modify event,
@@ -293,7 +201,15 @@ fn validate(catalog: &Catalog) -> Result<()> {
     if catalog.version != 1 {
         bail!("unsupported catalog version: {}", catalog.version);
     }
+    if catalog.entries.len() > MAX_ENTRIES {
+        bail!(
+            "catalog has {} entries, exceeds worker cap of {}",
+            catalog.entries.len(),
+            MAX_ENTRIES
+        );
+    }
     let mut listener_keys: HashSet<(String, IpAddr, u16, nls_proxy_wire::Proto)> = HashSet::new();
+    let mut total_backends: usize = 0;
     for (i, entry) in catalog.entries.iter().enumerate() {
         validate_uuid(&entry.net_id).with_context(|| format!("entries[{i}].net_id"))?;
         validate_uuid(&entry.service_id)
@@ -305,6 +221,20 @@ fn validate(catalog: &Catalog) -> Result<()> {
         }
         if entry.backends.is_empty() {
             bail!("entries[{i}].backends is empty");
+        }
+        if entry.backends.len() > MAX_BACKENDS_PER_ENTRY {
+            bail!(
+                "entries[{i}].backends has {} entries, exceeds per-entry cap of {}",
+                entry.backends.len(),
+                MAX_BACKENDS_PER_ENTRY
+            );
+        }
+        total_backends = total_backends.saturating_add(entry.backends.len());
+        if total_backends > MAX_TOTAL_BACKENDS {
+            bail!(
+                "catalog total backend count exceeds worker cap of {}",
+                MAX_TOTAL_BACKENDS
+            );
         }
         for (j, b) in entry.backends.iter().enumerate() {
             validate_backend_addr(b.addr)
@@ -322,6 +252,62 @@ fn validate(catalog: &Catalog) -> Result<()> {
                 entry.port,
                 entry.proto
             );
+        }
+        validate_health_check(&entry.health_check)
+            .with_context(|| format!("entries[{i}].health_check"))?;
+    }
+    Ok(())
+}
+
+fn validate_health_check(hc: &HealthCheck) -> Result<()> {
+    let common = match hc {
+        HealthCheck::TcpConnect { common }
+        | HealthCheck::UdpDnsQuery { common, .. }
+        | HealthCheck::UdpNtpQuery { common } => common,
+        HealthCheck::HttpGet { common, path, .. } => {
+            validate_http_origin_form_path(path)?;
+            common
+        }
+        HealthCheck::HttpsGet { common, path, .. } => {
+            validate_http_origin_form_path(path)?;
+            common
+        }
+    };
+    if common.interval_s < MIN_HC_INTERVAL_S {
+        bail!(
+            "interval_s={} is below worker floor of {}s",
+            common.interval_s,
+            MIN_HC_INTERVAL_S
+        );
+    }
+    if common.timeout_s < MIN_HC_TIMEOUT_S {
+        bail!(
+            "timeout_s={} is below worker floor of {}s",
+            common.timeout_s,
+            MIN_HC_TIMEOUT_S
+        );
+    }
+    if common.timeout_s > common.interval_s {
+        bail!(
+            "timeout_s={} exceeds interval_s={}; probes would overlap",
+            common.timeout_s,
+            common.interval_s
+        );
+    }
+    Ok(())
+}
+
+/// Reject HTTP request-target paths that aren't origin-form or that
+/// contain CR/LF/NUL — anything that could break out of the request
+/// line we interpolate into. RFC 7230 origin-form: must start with
+/// `/`, may carry a `?query`. We allow only printable ASCII (0x21..=0x7E).
+fn validate_http_origin_form_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("HTTP HC path must be origin-form (start with '/'); got {path:?}");
+    }
+    for (i, b) in path.bytes().enumerate() {
+        if !(0x21..=0x7E).contains(&b) {
+            bail!("HTTP HC path has disallowed byte 0x{b:02x} at offset {i}");
         }
     }
     Ok(())
@@ -512,6 +498,103 @@ mod tests {
         let p = write_catalog(dir.path(), &payload, &key());
         let err = load_and_verify(&p, &key()).unwrap_err();
         assert!(format!("{err:#}").contains("loopback"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_oversize_catalog() {
+        let mut entries = Vec::new();
+        for i in 0..(MAX_ENTRIES + 1) {
+            entries.push(serde_json::json!({
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": format!("11223344-5566-7788-99aa-{:012x}", i),
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": format!("169.254.169.{}", (i % 250) + 2),
+                "port": ((i % 60000) as u16) + 1024,
+                "proto": "udp",
+                "backends": [{"addr": "192.0.2.10", "port": 53}],
+                "health_check": {"type": "tcp_connect"}
+            }));
+        }
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": entries,
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds worker cap"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_too_many_backends_per_entry() {
+        let mut backends = Vec::new();
+        for i in 0..(MAX_BACKENDS_PER_ENTRY + 1) {
+            backends.push(serde_json::json!({
+                "addr": format!("192.0.2.{}", (i % 250) + 1),
+                "port": (i as u16) + 1024,
+            }));
+        }
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": [{
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": "11223344-5566-7788-99aa-bbccddeeff00",
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": "169.254.169.10", "port": 53, "proto": "udp",
+                "backends": backends,
+                "health_check": {"type": "tcp_connect"}
+            }]
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("per-entry cap"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_hc_interval_below_floor() {
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": [{
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": "11223344-5566-7788-99aa-bbccddeeff00",
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": "169.254.169.10", "port": 53, "proto": "udp",
+                "backends": [{"addr": "192.0.2.10", "port": 53}],
+                "health_check": {"type": "tcp_connect", "interval_s": 0, "timeout_s": 0}
+            }]
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("below worker floor"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_hc_timeout_exceeding_interval() {
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": [{
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": "11223344-5566-7788-99aa-bbccddeeff00",
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": "169.254.169.10", "port": 53, "proto": "udp",
+                "backends": [{"addr": "192.0.2.10", "port": 53}],
+                "health_check": {"type": "tcp_connect", "interval_s": 5, "timeout_s": 10}
+            }]
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds interval_s"), "{err:#}");
     }
 
     #[test]

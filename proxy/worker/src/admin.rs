@@ -8,14 +8,16 @@
 //!
 //! All routes except `/healthz` require `Authorization: Bearer <token>`
 //! where `<token>` is the contents of the per-boot token file
-//! configured at startup.
+//! configured at startup. The bearer compare is constant-time.
 //!
-//! The unix socket itself is mode 0600 + group `nls-admin` (chosen by
-//! the systemd unit). Bearer-token auth is defense-in-depth against
-//! anyone who already has the socket fd.
+//! Peer authorization: every accepted connection must come from a peer
+//! whose effective uid matches the worker's own uid (the agent runs as
+//! the same user). Filesystem mode is hardening on top of that, not
+//! authorization on its own.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -27,6 +29,12 @@ use axum::Json;
 use axum::Router;
 use serde_json::json;
 use tokio::sync::watch;
+
+/// Cap on simultaneously-served admin connections. The local agent
+/// is the only legitimate caller (peer_uid is uid-checked) and
+/// keeps a small pool for scrapes; anything past this cap is a
+/// scraper bug or a stuck handler.
+const MAX_CONCURRENT_CONNS: usize = 16;
 
 use crate::catalog::Catalog;
 use crate::hc::{Status, StatusMap};
@@ -80,9 +88,36 @@ async fn serve(socket_path: PathBuf, state: AdminState) -> Result<()> {
 
     tracing::info!(path = %socket_path.display(), "admin listening on unix socket");
 
+    let our_uid = nix::unistd::geteuid().as_raw();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+
     loop {
         let (stream, _) = listener.accept().await?;
+        match stream.peer_cred() {
+            Ok(cred) if cred.uid() == our_uid => {}
+            Ok(cred) => {
+                tracing::warn!(peer_uid = cred.uid(), "rejecting admin conn from foreign uid");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "admin peer_cred failed; dropping conn");
+                continue;
+            }
+        }
+        let prev = in_flight.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONCURRENT_CONNS {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!(
+                in_flight = prev,
+                cap = MAX_CONCURRENT_CONNS,
+                "admin: at concurrent-connection cap; dropping accept"
+            );
+            // Closing the stream sends FIN; the scraper will retry.
+            drop(stream);
+            continue;
+        }
         let app = app.clone();
+        let in_flight_for_task = Arc::clone(&in_flight);
         tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(app);
             let io = hyper_util::rt::TokioIo::new(stream);
@@ -94,6 +129,7 @@ async fn serve(socket_path: PathBuf, state: AdminState) -> Result<()> {
             {
                 tracing::debug!(error = %e, "admin conn error");
             }
+            in_flight_for_task.fetch_sub(1, Ordering::AcqRel);
         });
     }
 }
@@ -115,10 +151,26 @@ fn require_auth(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
     let prefix = "Bearer ";
-    if !got.starts_with(prefix) || &got[prefix.len()..] != expected {
+    let presented = got.strip_prefix(prefix).unwrap_or("");
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
+}
+
+/// Length-prefixed constant-time byte compare. Returns `false` for
+/// length mismatch without touching either buffer further; for equal
+/// lengths the loop's branch count is independent of where the bytes
+/// differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn clusters(

@@ -20,6 +20,8 @@ filtering events on ``external_ids`` keeps us tight to our own ports
 and skips the rest of the chatter on the chassis.
 """
 
+import time
+
 from neutron.agent.linux import ip_lib
 from neutron.agent.ovn.extensions import extension_manager
 from neutron.common.ovn import constants as ovn_const
@@ -219,6 +221,11 @@ class LocalportPortBindingDeletedEvent(_LocalServicesPortBindingEvent):
         except Exception:
             LOG.exception('netns teardown failed for network %s',
                           network_id)
+        # Drop the cached desired-state snapshot. If this network is
+        # later re-provisioned on the same chassis, reconcile starts
+        # from a fresh registry fetch rather than replaying state from
+        # the previous lifetime.
+        self.agent.forget_network(network_id)
 
 
 class LocalServicesExtension(extension_manager.OVNAgentExtension):
@@ -237,6 +244,14 @@ class LocalServicesExtension(extension_manager.OVNAgentExtension):
         self._registry = None
         self._loop = None
         self._underlay_allocator = None
+        # Per-network last-known-good desired state. We hold onto the
+        # most recent successful ``desired_state_for_network`` result
+        # per network so that a transient registry / Keystone outage
+        # doesn't cause the reconciler to withdraw VIPs and listener
+        # config that are still operator-desired. The cache is keyed
+        # by network_id and dropped on Port_Binding teardown.
+        self._lkg_state = {}
+        self._lkg_ts = {}  # monotonic timestamp of last successful fetch
 
     @property
     def name(self):
@@ -311,8 +326,9 @@ class LocalServicesExtension(extension_manager.OVNAgentExtension):
         """Pull desired VIPs from the registry, set-diff against the tap.
 
         Wrapped in try/except so a registry hiccup never takes down the
-        IDL thread (events) or the periodic loop. Logs and moves on;
-        the next pass will retry.
+        IDL thread (events) or the periodic loop. On a fetch failure
+        we skip the reconcile rather than withdraw — the next pass will
+        retry once the registry is reachable.
 
         Kept as a thin wrapper around the VIP-only path for the unit-test
         suite; the agent's events and timer go through ``reconcile_network``,
@@ -323,6 +339,11 @@ class LocalServicesExtension(extension_manager.OVNAgentExtension):
             return
         try:
             desired = self.registry.desired_vips_for_network(network_id)
+        except registry_client.RegistryFetchError as exc:
+            LOG.warning('Registry fetch failed for network %s; '
+                        'skipping VIP reconcile to preserve current '
+                        'on-host state: %s', network_id, exc)
+            return
         except Exception:
             LOG.exception('Failed to fetch desired VIPs for network %s',
                           network_id)
@@ -333,24 +354,71 @@ class LocalServicesExtension(extension_manager.OVNAgentExtension):
             LOG.exception('reconcile_vips failed for network %s',
                           network_id)
 
+    def staleness_seconds(self, network_id):
+        """Age (in seconds) of the cached desired state for a network.
+
+        Returns ``None`` if we have never fetched successfully for this
+        network. Operators can sample this to alert on a registry that
+        has been unreachable for too long; the agent itself just logs.
+        """
+        ts = self._lkg_ts.get(network_id)
+        if ts is None:
+            return None
+        return max(0.0, time.monotonic() - ts)
+
+    def forget_network(self, network_id):
+        """Drop cached last-known-good state for a torn-down network.
+
+        Called from the Port_Binding delete event handler so a
+        re-provisioned network on the same chassis doesn't reconcile
+        against stale cached state from its previous lifetime.
+        """
+        self._lkg_state.pop(network_id, None)
+        self._lkg_ts.pop(network_id, None)
+
     def reconcile_network(self, network_id):
         """Full reconcile: VIPs + plugin apply_config.
 
         One registry fetch per pass — backends and services are read in
         a single ``desired_state_for_network`` call so the VIP set
-        and the plugin config don't double-poll the API. On any
-        registry failure both reconciliations are skipped (and the next
-        pass retries); a per-plugin failure logs and moves on so one
-        broken plugin doesn't sink the others.
+        and the plugin config don't double-poll the API.
+
+        On a ``RegistryFetchError`` (Keystone catalog miss, transport
+        failure, non-2xx, or partial fan-out failure) we fall back to
+        the most recent successful fetch for this network so a transient
+        registry blip never causes us to withdraw VIPs / listener config
+        that the plugin still considers desired. If we have never seen
+        a successful fetch (cold start, registry was down at agent
+        boot), we skip the pass entirely; the next tick will retry.
+
+        A per-plugin failure logs and moves on so one broken plugin
+        doesn't sink the others.
         """
         if not network_id:
             return
         try:
             services = self.registry.desired_state_for_network(network_id)
+        except registry_client.RegistryFetchError as exc:
+            cached = self._lkg_state.get(network_id)
+            if cached is None:
+                LOG.warning('Registry fetch failed for network %s and '
+                            'no last-known-good state is cached; '
+                            'skipping reconcile pass: %s',
+                            network_id, exc)
+                return
+            age = self.staleness_seconds(network_id)
+            LOG.warning('Registry fetch failed for network %s; '
+                        'reconciling against last-known-good state '
+                        '(%d service(s), age %.1fs): %s',
+                        network_id, len(cached), age, exc)
+            services = cached
         except Exception:
             LOG.exception('Failed to fetch desired state for network %s',
                           network_id)
             return
+        else:
+            self._lkg_state[network_id] = services
+            self._lkg_ts[network_id] = time.monotonic()
 
         # Keep the kernel ARP-respond addresses on the tap.
         vips = {'%s/32' % s['local_ipv4']

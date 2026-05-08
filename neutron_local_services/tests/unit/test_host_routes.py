@@ -170,6 +170,23 @@ class TestComputeServiceRoutes(testtools.TestCase):
             self.core, self.context, _subnet(), services)
         self.assertEqual([], routes)
 
+    def test_skips_service_whose_vip_overlaps_subnet_cidr(self):
+        # Defense-in-depth: if a VIP slipped through (e.g. operator
+        # added a binding before the subnet was created and the
+        # subnet covers the VIP), don't publish a /32 that would
+        # hijack the on-link route. Both services should be filtered;
+        # the unrelated one (link-local VIP) still produces a route.
+        subnet = _subnet(cidr='10.0.0.0/24')
+        services = [_service(vip='10.0.0.5'),
+                    _service(vip='169.254.169.5')]
+        with mock.patch.object(hr, 'LOG') as log_mock:
+            routes, _ = hr.compute_service_routes(
+                self.core, self.context, subnet, services)
+        self.assertEqual(
+            [{'destination': '169.254.169.5/32', 'nexthop': '10.0.0.7'}],
+            routes)
+        self.assertTrue(log_mock.info.called)
+
 
 class TestHostRoutesHandler(testtools.TestCase):
 
@@ -264,6 +281,81 @@ class TestHostRoutesHandler(testtools.TestCase):
         self.assertEqual(
             [{'destination': '169.254.169.5/32', 'nexthop': '10.0.0.7'}],
             patch['host_routes'])
+
+    def test_before_create_refuses_when_explicitly_bound(self):
+        # Service is explicitly bound to NET_ID with enabled=True
+        # (default fixture). A new subnet whose CIDR would cover the
+        # service's VIP is refused — the operator chose this binding,
+        # so silently dropping the route would be more surprising.
+        self.plugin.get_local_service.return_value = _service(
+            vip='10.0.0.5')
+        subnet_data = {'network_id': NET_ID, 'cidr': '10.0.0.0/24',
+                       'host_routes': []}
+        payload = self._payload(states=(subnet_data,))
+        self.assertRaises(
+            hr.SubnetOverlapsServiceVIPError,
+            self.handler._on_before_create,
+            'subnet', events.BEFORE_CREATE, None, payload)
+
+    def test_before_create_skips_when_only_opt_out(self):
+        # No explicit binding; service is implicitly attached via
+        # opt-out. The subnet op proceeds with an INFO log;
+        # compute_service_routes will drop the conflicting /32 later.
+        self.plugin.get_local_service_bindings.return_value = []
+        self.plugin.get_local_services.return_value = [
+            {'id': 'svc-oo', 'local_ipv4': '10.0.0.5',
+             'attachment_policy': lsc.ATTACH_OPT_OUT,
+             'enabled': True}]
+        self.plugin.get_local_service.return_value = {
+            'id': 'svc-oo', 'local_ipv4': '10.0.0.5',
+            'attachment_policy': lsc.ATTACH_OPT_OUT,
+            'enabled': True}
+        subnet_data = {'network_id': NET_ID, 'cidr': '10.0.0.0/24',
+                       'host_routes': []}
+        payload = self._payload(states=(subnet_data,))
+        # Should NOT raise.
+        self.handler._on_before_create(
+            'subnet', events.BEFORE_CREATE, None, payload)
+
+    def test_before_update_skips_opt_out_overlap_on_host_routes_patch(self):
+        # Opt-out service whose VIP sits inside the subnet's CIDR. The
+        # overlap precheck lets the subnet op proceed (relying on the
+        # per-route filter for safety), so the injection path itself
+        # MUST still drop the /32 — otherwise a tenant
+        # ``host_routes`` PUT would re-publish the hijacking route.
+        self.plugin.get_local_service_bindings.return_value = []
+        self.plugin.get_local_services.return_value = [
+            {'id': 'svc-oo', 'local_ipv4': '10.0.0.5',
+             'attachment_policy': lsc.ATTACH_OPT_OUT,
+             'enabled': True}]
+        self.plugin.get_local_service.return_value = {
+            'id': 'svc-oo', 'local_ipv4': '10.0.0.5',
+            'attachment_policy': lsc.ATTACH_OPT_OUT,
+            'enabled': True}
+        orig = _subnet(cidr='10.0.0.0/24', host_routes=[])
+        # Tenant PUT clears host_routes; without the cidr-aware filter
+        # we would re-inject 10.0.0.5/32 as an on-link hijack.
+        patch = {'host_routes': []}
+        payload = self._payload(states=(orig, patch))
+        self.handler._on_before_update(
+            'subnet', events.BEFORE_UPDATE, None, payload)
+        # Either host_routes is left unset (no diff) or set to []. What
+        # must NOT appear is a /32 for the overlapping VIP.
+        injected = patch.get('host_routes', [])
+        self.assertNotIn(
+            {'destination': '10.0.0.5/32', 'nexthop': '10.0.0.7'},
+            injected)
+        self.assertEqual([], injected)
+
+    def test_before_create_allows_non_overlapping_subnet(self):
+        # Default service VIP is link-local 169.254.169.5, tenant
+        # subnet is 10.0.0.0/24 — no overlap.
+        subnet_data = {'network_id': NET_ID, 'cidr': '10.0.0.0/24',
+                       'host_routes': []}
+        payload = self._payload(states=(subnet_data,))
+        # Should not raise.
+        self.handler._on_before_create(
+            'subnet', events.BEFORE_CREATE, None, payload)
 
 
 class TestPluginRefreshSubnetRoutes(testtools.TestCase):
