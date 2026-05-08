@@ -1794,7 +1794,7 @@ test_underlay_egress() {
     echo "=== Underlay-backend reachability + tenant-escape ACL (nat + proxy) ==="
     # Both plugins should now reach underlay backends:
     #   - proxy: worker lives in host root netns; routing inherited.
-    #   - nat:   per-network nlsu veth + per-backend FORWARD ACL.
+    #   - nat:   per-network nls veth + per-backend FORWARD ACL.
     # Plus negative checks: a tenant must NOT be able to reach
     # arbitrary underlay destinations, only the configured backends.
 
@@ -1899,7 +1899,7 @@ for s in json.load(sys.stdin)['local_services']:
              "got: $(echo "$out_tcp" | head -c 200)"
     fi
 
-    # ---- nat plugin UDP assertions (per-network nlsu veth + ACL) -------
+    # ---- nat plugin UDP assertions (per-network nls veth + ACL) -------
     # The netns must have a default route via 100.64.x.1 (the host-side
     # underlay-egress IP); ipvsadm must list the backend as healthy
     # (HC reaches it through the new path); tenant dig succeeds.
@@ -1912,16 +1912,16 @@ for s in json.load(sys.stdin)['local_services']:
              "ip route: $(sudo ip netns exec "$ns_name" ip route | tr '\n' '|')"
     fi
     # Underlay veth pair present.
-    local nlsu_root
-    nlsu_root="nlsu${NET_ID:0:9}0"
-    if ip link show "$nlsu_root" >/dev/null 2>&1; then
-        pass "underlay-egress veth ${nlsu_root} present in host root netns"
+    local nls_root
+    nls_root="nls${NET_ID:0:10}0"
+    if ip link show "$nls_root" >/dev/null 2>&1; then
+        pass "underlay-egress veth ${nls_root} present in host root netns"
     else
-        fail "underlay-egress veth ${nlsu_root} missing"
+        fail "underlay-egress veth ${nls_root} missing"
     fi
     # Per-network FORWARD ACL chain present and contains the UDP rule.
     local chain
-    chain="NLS_UND_${NET_ID:0:9}"
+    chain="NLS_UND_${NET_ID:0:10}"
     if sudo iptables -t filter -S "$chain" 2>/dev/null \
             | grep -q -- "-d ${UNDERLAY_UDP_BACKEND_ADDR}.*--dport ${UNDERLAY_UDP_BACKEND_PORT}"; then
         pass "host FORWARD ACL chain ${chain} whitelists ${UNDERLAY_UDP_BACKEND_ADDR}:${UNDERLAY_UDP_BACKEND_PORT}"
@@ -1941,7 +1941,7 @@ for s in json.load(sys.stdin)['local_services']:
             /^TCP|^UDP/ {found=0}
             found && /->/ {print}
         ' | grep -q "$UNDERLAY_UDP_BACKEND_ADDR"; then
-        pass "ipvsadm shows the underlay UDP backend ${UNDERLAY_UDP_BACKEND_ADDR} (HC reaches it via nlsu veth)"
+        pass "ipvsadm shows the underlay UDP backend ${UNDERLAY_UDP_BACKEND_ADDR} (HC reaches it via nls veth)"
     else
         fail "ipvsadm does not list the underlay UDP backend (HC still failing — underlay egress broken)" \
              "ipvsadm: $(echo "$ipvs_udp" | head -20)"

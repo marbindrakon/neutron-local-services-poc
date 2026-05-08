@@ -126,8 +126,8 @@ reruns):
 
 By default the netns has only its on-subnet route. For backends on
 the chassis underlay (operator infrastructure), the agent provisions
-a per-network underlay-egress veth pair (`nlsu<short>0` host /
-`nlsu<short>1` ns) outside `br-int`, with a default route in the
+a per-network underlay-egress veth pair (`nls<short>0` host /
+`nls<short>1` ns) outside `br-int`, with a default route in the
 netns and SNAT in the host root netns. Defense-in-depth iptables
 rules close every escape path:
 
@@ -135,9 +135,9 @@ rules close every escape path:
   the configured backend `(proto, addr, port)` tuples — refreshed on
   every catalog change. **This is the load-bearing tenant-escape
   gate.**
-- Chassis-wide `-i nlsu+ -o nlsu+ -j DROP` blocks cross-tenant
+- Chassis-wide `-i nls+ -o nls+ -j DROP` blocks cross-tenant
   underlay cross-talk.
-- `rp_filter = 1` on both ends of every `nlsu` veth.
+- `rp_filter = 1` on both ends of every `nls` veth.
 - In-netns FORWARD permits the tenant→underlay flow plus the
   conntrack-tracked return path, with a catch-all DROP at the tail.
 

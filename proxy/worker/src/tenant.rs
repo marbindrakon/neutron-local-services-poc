@@ -146,13 +146,10 @@ async fn reconcile(
             let _ = handle.entry_tx.send(entry);
             continue;
         }
-        let nonce = entry.nonce.clone();
-        let nonce_path = entry.nonce_path.clone();
         let listener_fd = match priv_client::bind_listener(
             priv_socket,
             netns_fd.as_fd(),
-            &nonce,
-            &nonce_path,
+            net_id,
             entry.vip,
             entry.port,
             entry.proto,

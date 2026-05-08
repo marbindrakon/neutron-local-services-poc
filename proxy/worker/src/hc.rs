@@ -210,7 +210,7 @@ fn hc_common(hc: &HealthCheck) -> HcCommon {
         | HealthCheck::HttpGet { common, .. }
         | HealthCheck::HttpsHandshake { common, .. }
         | HealthCheck::UdpDnsQuery { common, .. }
-        | HealthCheck::Script { common, .. } => common.clone(),
+        | HealthCheck::UdpNtpQuery { common } => common.clone(),
     }
 }
 
@@ -229,7 +229,7 @@ async fn probe_once(hc: &HealthCheck, backend: &Backend) -> bool {
             probe_http(addr, "/", 0, true, sni.clone(), to).await
         }
         HealthCheck::UdpDnsQuery { query, .. } => probe_udp_dns(addr, query, to).await,
-        HealthCheck::Script { path, args, .. } => probe_script(addr, path, args, to).await,
+        HealthCheck::UdpNtpQuery { .. } => probe_udp_ntp(addr, to).await,
     }
 }
 
@@ -339,26 +339,139 @@ fn rand_id() -> u16 {
     (nanos & 0xffff) as u16
 }
 
-async fn probe_script(addr: SocketAddr, path: &str, args: &[String], to: Duration) -> bool {
-    // Shipped check scripts (check_dns.sh, check_ntp.sh) follow the
-    // Keepalived MISC_CHECK convention: positional args
-    // `<addr> <port>`. We also export the values as env vars so a
-    // script can pick whichever it prefers, then append any
-    // catalog-supplied extra args after the implicit positional pair.
-    let mut cmd = tokio::process::Command::new(path);
-    cmd.env("BACKEND_ADDR", addr.ip().to_string());
-    cmd.env("BACKEND_PORT", addr.port().to_string());
-    cmd.arg(addr.ip().to_string());
-    cmd.arg(addr.port().to_string());
-    cmd.args(args);
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    let child = match cmd.spawn() {
-        Ok(c) => c,
+async fn probe_udp_ntp(addr: SocketAddr, to: Duration) -> bool {
+    // SNTPv4 client request (RFC 4330): 48-byte packet, LI=0, VN=4,
+    // Mode=3 (client). Everything else zeroed; servers don't require
+    // anything else for a basic time response. We don't fill the
+    // transmit timestamp because we never compute offset — we only
+    // care that the server replies with mode=4 (server) and a
+    // synchronized stratum.
+    let mut req = [0u8; 48];
+    req[0] = 0b00_100_011; // LI=0, VN=4, Mode=3
+
+    let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
         Err(_) => return false,
     };
-    match timeout(to, child.wait_with_output()).await {
-        Ok(Ok(out)) => out.status.success(),
-        _ => false,
+    if timeout(to, socket.send_to(&req, addr)).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 48];
+    let n = match timeout(to, socket.recv(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        _ => return false,
+    };
+    if n < 48 {
+        return false;
+    }
+    // First byte: LI(2) | VN(3) | Mode(3). Mode must be 4 (server).
+    let mode = buf[0] & 0b0000_0111;
+    if mode != 4 {
+        return false;
+    }
+    // LI=3 means "alarm condition (unsynchronized)" — reject.
+    let li = (buf[0] & 0b1100_0000) >> 6;
+    if li == 3 {
+        return false;
+    }
+    // Stratum 0 is "kiss-of-death" (per RFC 4330 §5); 16 is
+    // "unsynchronized." Either disqualifies the server.
+    let stratum = buf[1];
+    if stratum == 0 || stratum >= 16 {
+        return false;
+    }
+    // Transmit timestamp must be non-zero on a real reply.
+    if buf[40..48] == [0u8; 8] {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod ntp_tests {
+    use super::*;
+
+    /// Spawn a one-shot fake NTP server that returns `reply_first_byte`
+    /// + `reply_stratum` + the supplied transmit-timestamp bytes.
+    /// Returns the bound address.
+    async fn spawn_fake_ntp(
+        reply_first_byte: u8,
+        reply_stratum: u8,
+        reply_xmit: [u8; 8],
+    ) -> SocketAddr {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 48];
+            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+            // First byte must look like a v4 client request (mode=3).
+            assert_eq!(buf[0] & 0b0000_0111, 3);
+            let mut reply = [0u8; 48];
+            reply[0] = reply_first_byte;
+            reply[1] = reply_stratum;
+            reply[40..48].copy_from_slice(&reply_xmit);
+            let _ = server.send_to(&reply, peer).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn accepts_well_formed_synchronized_reply() {
+        let addr = spawn_fake_ntp(
+            0b00_100_100, // LI=0, VN=4, Mode=4 (server)
+            2,
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        )
+        .await;
+        assert!(probe_udp_ntp(addr, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_mode() {
+        let addr = spawn_fake_ntp(
+            0b00_100_011, // Mode=3, not server
+            2,
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        )
+        .await;
+        assert!(!probe_udp_ntp(addr, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_kiss_of_death_stratum_0() {
+        let addr = spawn_fake_ntp(0b00_100_100, 0, [0, 0, 0, 0, 0, 0, 0, 1]).await;
+        assert!(!probe_udp_ntp(addr, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_unsynchronized_stratum_16() {
+        let addr = spawn_fake_ntp(0b00_100_100, 16, [0, 0, 0, 0, 0, 0, 0, 1]).await;
+        assert!(!probe_udp_ntp(addr, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_transmit_timestamp() {
+        let addr = spawn_fake_ntp(0b00_100_100, 2, [0u8; 8]).await;
+        assert!(!probe_udp_ntp(addr, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_alarm_li_3() {
+        let addr = spawn_fake_ntp(
+            0b11_100_100, // LI=3 (alarm), Mode=4
+            2,
+            [0, 0, 0, 0, 0, 0, 0, 1],
+        )
+        .await;
+        assert!(!probe_udp_ntp(addr, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn times_out_on_silent_server() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        // No spawned task — nobody answers.
+        assert!(!probe_udp_ntp(addr, Duration::from_millis(200)).await);
     }
 }

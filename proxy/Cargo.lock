@@ -785,12 +785,15 @@ name = "nls-proxy-priv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
+ "hmac",
  "libc",
  "nix",
  "nls-proxy-scm",
  "nls-proxy-wire",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
  "tracing-subscriber",

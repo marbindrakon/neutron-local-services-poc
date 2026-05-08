@@ -11,6 +11,8 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod catalog;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
@@ -24,23 +26,19 @@ pub enum Proto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    /// Open `/run/netns/<name>` and return the fd via SCM_RIGHTS.
-    OpenNetns {
-        name: String,
-    },
     /// Bind a listener inside the netns whose fd is attached as the
     /// single SCM_RIGHTS payload of this request. Returns the bound
     /// listener fd via SCM_RIGHTS.
     ///
-    /// Before `bind`, the priv helper reads `nonce_path` (with
-    /// `O_NOFOLLOW`) and verifies its contents equal `nonce`. This is
-    /// the nonce-based recycle check — Neutron network UUIDs are
-    /// never reused, so the primary mitigation is fd-handoff via
-    /// SCM_RIGHTS, but the nonce catches agent bugs that pair the
-    /// wrong netns fd with the wrong catalog entry.
+    /// Authorization. The priv helper looks up
+    /// `(net_id, vip, port, proto)` in its own copy of the
+    /// agent-signed catalog and refuses if no matching entry exists.
+    /// The nonce string + nonce_path used for the post-`setns()`
+    /// recycle check come from that catalog entry — the worker has no
+    /// say in either, so a compromised worker cannot redirect the
+    /// nonce read to an attacker-controlled path or skip the check.
     BindListener {
-        nonce: String,
-        nonce_path: String,
+        net_id: String,
         vip: IpAddr,
         port: u16,
         proto: Proto,
@@ -50,8 +48,6 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
-    /// Returned for `OpenNetns`. Single fd in SCM_RIGHTS.
-    OpenedNetns,
     /// Returned for `BindListener`. Single fd in SCM_RIGHTS.
     BoundListener,
     /// Failure path. No fd attached.
@@ -123,25 +119,9 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn round_trip_open_netns() {
-        let req = Request::OpenNetns {
-            name: "localsvc-deadbeef".into(),
-        };
-        let mut buf = Vec::new();
-        write_frame(&mut buf, &req).unwrap();
-        let mut cur = Cursor::new(buf);
-        let got: Request = read_frame(&mut cur).unwrap();
-        match got {
-            Request::OpenNetns { name } => assert_eq!(name, "localsvc-deadbeef"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn round_trip_bind_listener_v6() {
         let req = Request::BindListener {
-            nonce: "abc123".into(),
-            nonce_path: "/var/run/nls/nonces/N".into(),
+            net_id: "11111111-1111-1111-1111-111111111111".into(),
             vip: "fe80::1".parse().unwrap(),
             port: 5353,
             proto: Proto::Udp,
@@ -152,14 +132,12 @@ mod tests {
         let got: Request = read_frame(&mut cur).unwrap();
         match got {
             Request::BindListener {
-                nonce,
-                nonce_path,
+                net_id,
                 vip,
                 port,
                 proto,
             } => {
-                assert_eq!(nonce, "abc123");
-                assert_eq!(nonce_path, "/var/run/nls/nonces/N");
+                assert_eq!(net_id, "11111111-1111-1111-1111-111111111111");
                 assert_eq!(vip, "fe80::1".parse::<IpAddr>().unwrap());
                 assert_eq!(port, 5353);
                 assert_eq!(proto, Proto::Udp);
@@ -170,8 +148,11 @@ mod tests {
 
     #[test]
     fn frame_too_large_rejected() {
-        let req = Request::OpenNetns {
-            name: "x".repeat(MAX_FRAME_BYTES + 1),
+        let req = Request::BindListener {
+            net_id: "x".repeat(MAX_FRAME_BYTES + 1),
+            vip: "169.254.42.1".parse().unwrap(),
+            port: 80,
+            proto: Proto::Tcp,
         };
         let mut buf = Vec::new();
         let err = write_frame(&mut buf, &req).unwrap_err();

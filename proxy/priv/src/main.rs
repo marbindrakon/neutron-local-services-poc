@@ -1,10 +1,9 @@
 //! `nls-proxy-priv` — privileged helper for `nls-proxy`.
 //!
 //! Trust boundary. Holds `CAP_SYS_ADMIN` (for `setns`) and
-//! `CAP_NET_BIND_SERVICE` (for low-port bind). Does nothing except
-//! receive RPC requests on a unix socket and hand back file
-//! descriptors over SCM_RIGHTS. The worker (`nls-proxy`) holds zero
-//! capabilities and runs all proxy logic.
+//! `CAP_NET_BIND_SERVICE` (for low-port bind). Exposes a single RPC —
+//! `BindListener` — over a unix socket. The worker (`nls-proxy`)
+//! holds zero capabilities and runs all proxy logic.
 //!
 //! Peer authorization. The unix socket is `0660 root:nls-admin` so
 //! filesystem mode keeps unrelated users out, but **socket mode is
@@ -12,6 +11,14 @@
 //! and refuses any peer that isn't a member of the configured peer
 //! group (default `nls-admin`). Root peers are refused outright —
 //! the priv helper has no legitimate root callers.
+//!
+//! Catalog-driven authorization. Every `BindListener` re-reads the
+//! agent-signed catalog (`catalog.json` + `hmac.key`, same files the
+//! worker watches) and refuses any `(net_id, vip, port, proto)`
+//! tuple that isn't an entry. The post-`setns()` nonce check uses the
+//! catalog entry's own `nonce` and `nonce_path` — the worker doesn't
+//! influence either, so a compromised worker cannot widen what gets
+//! bound or where the recycle-check file lives.
 //!
 //! Each `BindListener` request runs on a freshly spawned thread that
 //! `setns()`s into the requested netns, performs `socket → bind →
@@ -22,16 +29,31 @@
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+mod catalog;
 mod netns;
 mod nonce;
 mod rpc;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/neutron-local-services/_proxy/priv.sock";
 const DEFAULT_PEER_GROUP: &str = "nls-admin";
+const DEFAULT_CATALOG_PATH: &str = "/var/lib/neutron-local-services/_proxy/catalog.json";
+const DEFAULT_HMAC_KEY_PATH: &str = "/var/lib/neutron-local-services/_proxy/hmac.key";
+const DEFAULT_NONCE_DIR: &str = "/var/lib/neutron-local-services/_proxy/nonces";
+
+/// Read-only refs held for the priv process's lifetime and consulted on
+/// every `BindListener`. Cheap to clone (Arc / OwnedFd-as-Arc), so we
+/// hand a clone to each connection thread.
+#[derive(Clone)]
+struct PrivContext {
+    catalog_path: Arc<PathBuf>,
+    hmac_key: Arc<Vec<u8>>,
+    nonce_dir_fd: Arc<OwnedFd>,
+}
 
 fn main() -> Result<()> {
     init_tracing();
@@ -44,6 +66,38 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_PEER_GROUP.to_owned());
     let peer_gid = resolve_group(&peer_group)
         .with_context(|| format!("resolve gid for peer group {peer_group:?}"))?;
+
+    // Catalog / HMAC key / nonce dir come from the same agent-managed
+    // state directory the worker reads (see proxy/worker/src/main.rs).
+    // Defaults match; env vars allow overrides for tests.
+    let catalog_path = std::env::var("NLS_PROXY_CATALOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CATALOG_PATH));
+    let hmac_key_path = std::env::var("NLS_PROXY_HMAC_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_HMAC_KEY_PATH));
+    let nonce_dir = std::env::var("NLS_PROXY_NONCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_NONCE_DIR));
+
+    let hmac_key = std::fs::read(&hmac_key_path)
+        .with_context(|| format!("read HMAC key {}", hmac_key_path.display()))?;
+    if hmac_key.is_empty() {
+        bail!("HMAC key file {} is empty", hmac_key_path.display());
+    }
+    let nonce_dir_fd = nonce::open_nonce_dir(&nonce_dir)
+        .with_context(|| format!("open nonce dir {}", nonce_dir.display()))?;
+    let priv_ctx = PrivContext {
+        catalog_path: Arc::new(catalog_path),
+        hmac_key: Arc::new(hmac_key),
+        nonce_dir_fd: Arc::new(nonce_dir_fd),
+    };
+    tracing::info!(
+        catalog = %priv_ctx.catalog_path.display(),
+        nonce_dir = %nonce_dir.display(),
+        hmac_key_bytes = priv_ctx.hmac_key.len(),
+        "loaded BindListener authorization context",
+    );
 
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
@@ -81,10 +135,11 @@ fn main() -> Result<()> {
                     // peer_authorized logs the reason; just drop.
                     continue;
                 }
+                let conn_ctx = priv_ctx.clone();
                 thread::Builder::new()
                     .name("priv-conn".into())
                     .spawn(move || {
-                        if let Err(e) = handle_connection(stream) {
+                        if let Err(e) = handle_connection(stream, &conn_ctx) {
                             tracing::warn!(error = %e, "client connection ended with error");
                         }
                     })
@@ -207,11 +262,14 @@ fn chmod_2770(path: &std::path::Path) -> Result<()> {
         .with_context(|| format!("chmod 2770 {}", path.display()))
 }
 
-fn handle_connection(stream: std::os::unix::net::UnixStream) -> Result<()> {
+fn handle_connection(
+    stream: std::os::unix::net::UnixStream,
+    ctx: &PrivContext,
+) -> Result<()> {
     loop {
         match rpc::recv_request(&stream) {
             Ok((req, fds)) => {
-                let response = dispatch(req, fds);
+                let response = dispatch(req, fds, ctx);
                 rpc::send_response(&stream, response)?;
             }
             Err(rpc::RpcError::Eof) => return Ok(()),
@@ -223,16 +281,15 @@ fn handle_connection(stream: std::os::unix::net::UnixStream) -> Result<()> {
     }
 }
 
-fn dispatch(req: nls_proxy_wire::Request, in_fds: Vec<OwnedFd>) -> rpc::Outgoing {
+fn dispatch(
+    req: nls_proxy_wire::Request,
+    in_fds: Vec<OwnedFd>,
+    ctx: &PrivContext,
+) -> rpc::Outgoing {
     use nls_proxy_wire::Request;
     match req {
-        Request::OpenNetns { name } => match handle_open_netns(&name) {
-            Ok(fd) => rpc::Outgoing::ok_with_fd(nls_proxy_wire::Response::OpenedNetns, fd),
-            Err(e) => rpc::Outgoing::err(format!("OpenNetns({name}): {e:#}")),
-        },
         Request::BindListener {
-            nonce,
-            nonce_path,
+            net_id,
             vip,
             port,
             proto,
@@ -241,43 +298,14 @@ fn dispatch(req: nls_proxy_wire::Request, in_fds: Vec<OwnedFd>) -> rpc::Outgoing
                 Ok(fd) => fd,
                 Err(e) => return rpc::Outgoing::err(format!("BindListener: {e:#}")),
             };
-            match handle_bind_listener(netns_fd, &nonce, &nonce_path, vip, port, proto) {
+            match handle_bind_listener(netns_fd, &net_id, vip, port, proto, ctx) {
                 Ok(fd) => rpc::Outgoing::ok_with_fd(nls_proxy_wire::Response::BoundListener, fd),
-                Err(e) => rpc::Outgoing::err(format!("BindListener: {e:#}")),
+                Err(e) => rpc::Outgoing::err(format!(
+                    "BindListener(net_id={net_id}, {vip}:{port}/{proto:?}): {e:#}"
+                )),
             }
         }
     }
-}
-
-fn handle_open_netns(name: &str) -> Result<OwnedFd> {
-    if !is_safe_netns_name(name) {
-        bail!("unsafe netns name: {name:?}");
-    }
-    let path = format!("/run/netns/{name}");
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    let cpath =
-        std::ffi::CString::new(std::path::Path::new(&path).as_os_str().as_bytes()).unwrap();
-    // SAFETY: we pass a NUL-terminated path and known-good flags. The
-    // returned fd is owned and tracked by `OwnedFd`.
-    let raw = unsafe {
-        libc_open(
-            cpath.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error()).context(format!("open({path})"));
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
-}
-
-fn is_safe_netns_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Caller must hand us **exactly one** fd that refers to a network
@@ -295,21 +323,53 @@ fn exactly_one_netns_fd(fds: Vec<OwnedFd>) -> Result<OwnedFd> {
 
 fn handle_bind_listener(
     netns_fd: OwnedFd,
-    nonce: &str,
-    nonce_path: &str,
+    net_id: &str,
     vip: std::net::IpAddr,
     port: u16,
     proto: nls_proxy_wire::Proto,
+    ctx: &PrivContext,
 ) -> Result<OwnedFd> {
-    let nonce = nonce.to_owned();
-    let nonce_path = nonce_path.to_owned();
+    // Step 1: load + verify the agent-signed catalog. The HMAC envelope
+    // is the trust root for everything below — if it doesn't verify,
+    // we refuse before any netns work.
+    let cat = catalog::load_and_verify(&ctx.catalog_path, &ctx.hmac_key)
+        .context("load + verify catalog")?;
+
+    // Step 2: authorize the (net_id, vip, port, proto) tuple against
+    // the catalog. Without this check, a compromised worker holding a
+    // tenant netns fd could ask us to bind on any (vip, port, proto)
+    // it likes inside that netns. Refusing here pins the worker's
+    // capability surface to exactly what the operator authorized.
+    let entry = match catalog::lookup_entry(&cat, net_id, vip, port, proto) {
+        Some(e) => e,
+        None => bail!(
+            "no catalog entry for (net_id={net_id}, vip={vip}, port={port}, proto={proto:?}); refusing"
+        ),
+    };
+
+    // Step 3: pull the canonical nonce + nonce filename from the
+    // catalog. The worker doesn't get to influence either.
+    let nonce = entry.nonce.clone();
+    let nonce_basename = std::path::Path::new(&entry.nonce_path)
+        .file_name()
+        .ok_or_else(|| anyhow!(
+            "catalog entry's nonce_path has no filename component: {:?}",
+            entry.nonce_path
+        ))?
+        .to_owned();
+
+    let nonce_dir_fd = Arc::clone(&ctx.nonce_dir_fd);
 
     let join = thread::Builder::new()
         .name("bind-helper".into())
         .spawn(move || -> Result<OwnedFd> {
             netns::setns_to(netns_fd.as_fd())
                 .context("setns into tenant netns")?;
-            nonce::verify_nonce(&nonce_path, &nonce)
+            // setns(CLONE_NEWNET) leaves the mount namespace alone, so
+            // nonce_dir_fd (opened in priv's mount ns) is still valid
+            // here. The openat2 + RESOLVE_BENEATH on nonce_dir_fd is
+            // belt-and-suspenders against a tainted nonce_path string.
+            nonce::verify_nonce_at(nonce_dir_fd.as_fd(), &nonce_basename, &nonce)
                 .context("verify tenant nonce file")?;
             let fd = bind_listener_in_current_netns(vip, port, proto)
                 .context("bind listener in tenant netns")?;
@@ -358,8 +418,4 @@ fn set_ipv6_v6only(fd: std::os::fd::RawFd) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("setsockopt IPV6_V6ONLY");
     }
     Ok(())
-}
-
-unsafe fn libc_open(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int {
-    libc::open(path, flags)
 }

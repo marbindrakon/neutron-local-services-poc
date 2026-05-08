@@ -24,7 +24,7 @@ arbitrary destinations and have the netns forward them):
   exactly the (proto, dst, dport) tuples for the configured backend
   set. Reconciled on every catalog change. Default DROP at the tail.
 * Inter-tenant cross-talk via underlay is blocked by a chassis-wide
-  ``-i nlsu+ -o nlsu+ -j DROP`` rule.
+  ``-i nls+ -o nls+ -j DROP`` rule.
 * rp_filter is enforced on both ends of the new veth.
 
 The architectural barrier (LVS DNAT is the only way for a tenant to
@@ -303,9 +303,9 @@ def install_chassis_chain(pool_cidr):
 
     Sets up:
       - filter/NEUTRON_LOCAL_SVC_UNDERLAY chain, jumped from FORWARD
-        AND from INPUT with ``-i nlsu+``
+        AND from INPUT with ``-i nls+``
       - filter/NEUTRON_LOCAL_SVC_UNDERLAY: ESTABLISHED,RELATED ACCEPT
-      - filter/NEUTRON_LOCAL_SVC_UNDERLAY: -i nlsu+ -o nlsu+ DROP
+      - filter/NEUTRON_LOCAL_SVC_UNDERLAY: -i nls+ -o nls+ DROP
         (block inter-tenant cross-talk via underlay)
       - nat/POSTROUTING: SNAT for the pool CIDR
 

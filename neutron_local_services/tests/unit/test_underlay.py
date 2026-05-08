@@ -212,7 +212,7 @@ class TestInstallChassisChain(testtools.TestCase):
 
     def test_jumps_from_input_for_underlay_veths(self):
         # New rule that closes the tenant→host-IP isolation gap.
-        # The jump is scoped to ``-i nlsu+`` so it doesn't affect
+        # The jump is scoped to ``-i nls+`` so it doesn't affect
         # unrelated host traffic on other interfaces.
         underlay.install_chassis_chain('100.64.0.0/22')
         self.assertTrue(self._has_rule(

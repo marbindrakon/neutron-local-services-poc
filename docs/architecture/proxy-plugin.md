@@ -239,10 +239,14 @@ semantics.
 
 `nls-proxy-wire` defines the JSON RPC message types:
 
-- `OpenNetns(name) → fd`
-- `BindListener(netns_fd, vip, port, proto) → listener_fd`
-- `AddNetns(net_id, fd)` (agent → worker)
-- `CloseNetns(fd)` (agent → worker)
+- `BindListener(net_id, vip, port, proto) + netns_fd → listener_fd`
+  (priv ↔ worker; priv consults the agent-signed catalog and refuses
+  any `(net_id, vip, port, proto)` that isn't an entry, then verifies
+  the catalog's nonce inside the tenant netns before binding)
+- `AddNetns(net_id) + netns_fd` (agent → worker; the agent opens
+  `/run/netns/<localsvc-net_id>` directly — the priv helper is no
+  longer in this path)
+- `RemoveNetns(net_id)` (agent → worker)
 
 ## Failure modes
 

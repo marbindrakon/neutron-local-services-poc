@@ -59,7 +59,7 @@ Concretely the architecture must:
   │   local-services-extension:                                        │
   │     • watches SB Port_Binding for our localport rows               │
   │     • per-network localsvc-<network> netns lifecycle               │
-  │     • plumbs tap (br-int) + underlay-egress (nlsu) veths           │
+  │     • plumbs tap (br-int) + underlay-egress (nls) veths           │
   │     • reconciles link-local /32 VIPs on the tap                    │
   │     • dispatches per-service catalog slices to exposure plugins    │
   │     • polls registry every 10s; events trigger immediate reconcile │
@@ -103,7 +103,7 @@ Concretely the architecture must:
   │  + /32 service VIPs      │  │  + /32 service VIPs      │
   │                          │  │                          │
   │  underlay-egress veth    │  │  underlay-egress veth    │
-  │  (nlsu) — default route  │  │  (nlsu) — default route  │
+  │  (nls) — default route  │  │  (nls) — default route  │
   │  to host root netns      │  │  to host root netns      │
   │                          │  │                          │
   │  proxy listeners (priv-  │  │  proxy listeners (priv-  │
@@ -113,7 +113,7 @@ Concretely the architecture must:
                 │                              │
                 ▼ (proxy worker dials from     ▼
                    host root netns; nat plumbs
-                   via nlsu+SNAT)
+                   via nls+SNAT)
   ┌────────────────────────────────────────────────┐
   │  host root netns                               │
   │  underlay routing / service VRF                │
@@ -213,7 +213,7 @@ A chassis-local extension to ovn-agent (`local_services` in
 - Brings up a `localsvc-<network_uuid>` netns and plumbs a tenant-
   side veth (`tls<short>`) into it from `br-int` with `iface-id ==
   <localport_id>` so ovn-controller binds the LSP.
-- Plumbs an underlay-egress veth (`nlsu<short>`) from the netns to
+- Plumbs an underlay-egress veth (`nls<short>`) from the netns to
   the host root netns over a /30 from a configurable RFC6598 pool
   (default `100.64.0.0/22`). This lets the `nat` plugin's
   Keepalived/ip_vs reach operator backends on the chassis underlay.
@@ -247,8 +247,8 @@ maintains:
 - A tenant-side veth pair (`tls<short>0` host / `tls<short>1` ns)
   attached to `br-int` with `iface-id == <localport_id>` so OVN
   forwards tenant frames to the netns.
-- An underlay-egress veth pair (`nlsu<short>0` host /
-  `nlsu<short>1` ns) entirely in the host root netns (NOT on
+- An underlay-egress veth pair (`nls<short>0` host /
+  `nls<short>1` ns) entirely in the host root netns (NOT on
   `br-int`). The host-side end SNATs the netns CIDR to the chassis's
   egress IP via `iptables -t nat POSTROUTING`. The ns-side end
   carries a default route in the netns.
@@ -262,7 +262,7 @@ maintains:
 The `nat` plugin's Keepalived runs *inside* the per-tenant netns,
 which by default has only its on-subnet route. To reach operator
 backends on the chassis underlay, the agent provisions the
-`nlsu<short>` veth pair described above, plus protections on both
+`nls<short>` veth pair described above, plus protections on both
 ends:
 
 - **In the host root netns**, a per-network `NLS_UND_<short>` chain
@@ -270,9 +270,9 @@ ends:
   tuples (including any `health_check_address` / `health_check_port`
   overrides). Default DROP at the chain tail. Reconciled on every
   catalog change. **This is the primary tenant-escape gate.**
-- **Chassis-wide**, `-i nlsu+ -o nlsu+ -j DROP` blocks one tenant
+- **Chassis-wide**, `-i nls+ -o nls+ -j DROP` blocks one tenant
   from cross-talking another tenant's underlay path.
-- **rp_filter = 1** on both ends of every `nlsu` veth.
+- **rp_filter = 1** on both ends of every `nls` veth.
 - **In the netns**, FORWARD permits the tenant→underlay flow
   (allowing the standard ip_vs DNAT path to work) and the
   conntrack-tracked return path; the catch-all `DROP` at the tail
