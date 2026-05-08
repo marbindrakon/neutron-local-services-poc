@@ -316,9 +316,17 @@ class HostRoutesHandler:
         # binding; the binding's localport sits in *another* subnet of
         # the same network and our nexthop computation correctly
         # returns None for the new subnet.
+        #
+        # ``cidr`` must be carried through so compute_service_routes can
+        # apply its overlap filter. Without it, an opt-out service whose
+        # VIP overlaps this subnet (allowed past the BEFORE_UPDATE
+        # overlap check on the assumption the per-route filter would
+        # catch it) would still get injected as a /32, hijacking
+        # tenant traffic for that on-link address.
         subnet_dict = {
             'id': subnet_for_lookup.get('id') or target.get('id'),
             'network_id': network_id,
+            'cidr': target.get('cidr') or subnet_for_lookup.get('cidr'),
         }
         services = _enabled_services_for_network(
             self._plugin, context, network_id)

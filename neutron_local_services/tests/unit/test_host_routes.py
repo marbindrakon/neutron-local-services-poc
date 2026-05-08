@@ -317,6 +317,36 @@ class TestHostRoutesHandler(testtools.TestCase):
         self.handler._on_before_create(
             'subnet', events.BEFORE_CREATE, None, payload)
 
+    def test_before_update_skips_opt_out_overlap_on_host_routes_patch(self):
+        # Opt-out service whose VIP sits inside the subnet's CIDR. The
+        # overlap precheck lets the subnet op proceed (relying on the
+        # per-route filter for safety), so the injection path itself
+        # MUST still drop the /32 — otherwise a tenant
+        # ``host_routes`` PUT would re-publish the hijacking route.
+        self.plugin.get_local_service_bindings.return_value = []
+        self.plugin.get_local_services.return_value = [
+            {'id': 'svc-oo', 'local_ipv4': '10.0.0.5',
+             'attachment_policy': lsc.ATTACH_OPT_OUT,
+             'enabled': True}]
+        self.plugin.get_local_service.return_value = {
+            'id': 'svc-oo', 'local_ipv4': '10.0.0.5',
+            'attachment_policy': lsc.ATTACH_OPT_OUT,
+            'enabled': True}
+        orig = _subnet(cidr='10.0.0.0/24', host_routes=[])
+        # Tenant PUT clears host_routes; without the cidr-aware filter
+        # we would re-inject 10.0.0.5/32 as an on-link hijack.
+        patch = {'host_routes': []}
+        payload = self._payload(states=(orig, patch))
+        self.handler._on_before_update(
+            'subnet', events.BEFORE_UPDATE, None, payload)
+        # Either host_routes is left unset (no diff) or set to []. What
+        # must NOT appear is a /32 for the overlapping VIP.
+        injected = patch.get('host_routes', [])
+        self.assertNotIn(
+            {'destination': '10.0.0.5/32', 'nexthop': '10.0.0.7'},
+            injected)
+        self.assertEqual([], injected)
+
     def test_before_create_allows_non_overlapping_subnet(self):
         # Default service VIP is link-local 169.254.169.5, tenant
         # subnet is 10.0.0.0/24 — no overlap.
