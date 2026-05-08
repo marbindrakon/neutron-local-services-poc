@@ -134,6 +134,19 @@ async fn reconcile_probes(
         if probes.contains_key(&id) {
             continue;
         }
+        // HC=none: never poll. Mark Up immediately and store a
+        // placeholder handle so the catalog-removal path still cleans
+        // up the status entry. Keeps the worker's data flow uniform
+        // (probes HashMap is the authoritative "what's alive" set)
+        // without burning a tokio task on a no-op tick loop.
+        if matches!(hc, HealthCheck::NoCheck { .. }) {
+            let mut next = (**status_tx.borrow()).clone();
+            next.insert(id.clone(), Status::Up);
+            let _ = status_tx.send(Arc::new(next));
+            let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel();
+            probes.insert(id, ProbeHandle { cancel: cancel_tx });
+            continue;
+        }
         // Seed the status as Unknown until the first probe completes.
         {
             let mut next = (**status_tx.borrow()).clone();
@@ -210,7 +223,8 @@ fn current_status(tx: &watch::Sender<StatusMap>, id: &BackendId) -> Status {
 
 fn hc_common(hc: &HealthCheck) -> HcCommon {
     match hc {
-        HealthCheck::TcpConnect { common }
+        HealthCheck::NoCheck { common }
+        | HealthCheck::TcpConnect { common }
         | HealthCheck::HttpGet { common, .. }
         | HealthCheck::HttpsGet { common, .. }
         | HealthCheck::UdpDnsQuery { common, .. }
@@ -223,6 +237,10 @@ async fn probe_once(hc: &HealthCheck, backend: &Backend) -> bool {
     let to = Duration::from_secs(common.timeout_s.max(1) as u64);
     let addr = SocketAddr::new(backend.addr, backend.port);
     match hc {
+        // Defensive: reconcile_probes never spawns a task for NoCheck
+        // (it short-circuits to Status::Up at registration), so this
+        // arm is unreachable in practice. Wired up for exhaustiveness.
+        HealthCheck::NoCheck { .. } => true,
         HealthCheck::TcpConnect { .. } => probe_tcp(addr, to).await,
         HealthCheck::HttpGet {
             path,

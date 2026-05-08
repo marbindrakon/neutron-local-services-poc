@@ -184,7 +184,7 @@ _LB_ALGO = {
 }
 
 # HC type translation. The worker supports a closed set of native
-# probes: tcp_connect, http_get, https_get, udp_dns_query,
+# probes: none, tcp_connect, http_get, https_get, udp_dns_query,
 # udp_ntp_query. There is intentionally no path-execution variant on
 # the wire — the API surface (HC_TYPES) and the catalog schema agree
 # on this set, so a tampered or buggy catalog cannot ask the worker
@@ -196,7 +196,9 @@ def _hc_for_service(svc):
     health_check object."""
     hc_type = svc.get('health_check_type') or lsc.HC_NONE
     if hc_type == lsc.HC_NONE:
-        return {'type': 'tcp_connect'}  # cheapest default
+        # No HC: worker treats every backend as Up. Mirrors the nat
+        # plugin's HC_NONE (renders no keepalived MISC_CHECK at all).
+        return {'type': 'none'}
     if hc_type == lsc.HC_TCP:
         return {'type': 'tcp_connect'}
     if hc_type == lsc.HC_HTTP:
@@ -211,7 +213,7 @@ def _hc_for_service(svc):
         return {'type': 'udp_dns_query'}
     if hc_type == lsc.HC_NTP:
         return {'type': 'udp_ntp_query'}
-    return {'type': 'tcp_connect'}
+    return {'type': 'none'}
 
 
 def _expand_protocols(svc):

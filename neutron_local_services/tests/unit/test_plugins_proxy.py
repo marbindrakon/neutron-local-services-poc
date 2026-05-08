@@ -3,7 +3,7 @@
 The proxy plugin emits HMAC-signed catalog entries the Rust worker
 consumes. The catalog wire intentionally has a closed set of native
 HC variants — there is no path-execution variant — so the API-side
-HC types must all map to one of {tcp_connect, http_get,
+HC types must all map to one of {none, tcp_connect, http_get,
 https_get, udp_dns_query, udp_ntp_query}.
 """
 
@@ -31,9 +31,12 @@ def _svc(**overrides):
 
 class HcForServiceTests(testtools.TestCase):
 
-    def test_none_defaults_to_tcp_connect(self):
+    def test_none_emits_none_variant(self):
+        # HC_NONE means "no health check" — the worker treats every
+        # backend as Up. Mirrors the nat plugin (which renders no
+        # keepalived MISC_CHECK for HC_NONE).
         self.assertEqual(
-            {'type': 'tcp_connect'},
+            {'type': 'none'},
             proxy_plugin._hc_for_service(_svc(health_check_type=lsc.HC_NONE)))
 
     def test_tcp(self):
