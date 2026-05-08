@@ -193,8 +193,11 @@ all tenants. Probe types:
 
 - `tcp_connect` — connect within `timeout_s`.
 - `http_get` — status code match against `health_check_config`.
-- `https_handshake` — TLS handshake (no cert verification by
-  default).
+- `https_get` — TLS connect + HTTP GET, status-code match. Mirrors the
+  `nat` plugin's keepalived `SSL_GET`. Cert verification is skipped
+  (matches keepalived's default) so self-signed and internal-CA
+  backends work without operator-supplied trust anchors. SNI is
+  optional via the `sni` field.
 - `udp_dns_query` — built-in DNS A query for a configurable name.
 - `script` — runs Keepalived `MISC_CHECK`-compatible scripts. Reuses
   the same `agent/plugins/check_scripts/` directory the `nat`

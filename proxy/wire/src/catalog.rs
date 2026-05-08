@@ -82,9 +82,13 @@ pub enum HealthCheck {
         #[serde(default = "default_http_status")]
         expect_status: u16,
     },
-    HttpsHandshake {
+    HttpsGet {
         #[serde(flatten)]
         common: HcCommon,
+        #[serde(default = "default_http_path")]
+        path: String,
+        #[serde(default = "default_http_status")]
+        expect_status: u16,
         #[serde(default)]
         sni: Option<String>,
     },
@@ -102,6 +106,9 @@ pub enum HealthCheck {
 
 fn default_http_status() -> u16 {
     200
+}
+fn default_http_path() -> String {
+    "/".into()
 }
 fn default_dns_query() -> String {
     "health.invalid".into()
@@ -158,6 +165,36 @@ mod tests {
         })
         .unwrap();
         assert!(back.contains(r#""type":"udp_ntp_query""#));
+    }
+
+    #[test]
+    fn https_get_defaults_to_root_path_and_status_200() {
+        let json = r#"{"type":"https_get"}"#;
+        let hc: HealthCheck = serde_json::from_str(json).unwrap();
+        match hc {
+            HealthCheck::HttpsGet {
+                path,
+                expect_status,
+                sni,
+                ..
+            } => {
+                assert_eq!(path, "/");
+                assert_eq!(expect_status, 200);
+                assert!(sni.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_https_handshake_variant_no_longer_parses() {
+        let json = r#"{"type":"https_handshake"}"#;
+        let err = serde_json::from_str::<HealthCheck>(json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown variant") || msg.contains("https_handshake"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

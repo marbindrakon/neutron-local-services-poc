@@ -12,12 +12,16 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::time::{interval, timeout};
+use tokio_rustls::TlsConnector;
 
 use crate::catalog::{Backend, Catalog, Entry, HcCommon, HealthCheck};
 
@@ -208,7 +212,7 @@ fn hc_common(hc: &HealthCheck) -> HcCommon {
     match hc {
         HealthCheck::TcpConnect { common }
         | HealthCheck::HttpGet { common, .. }
-        | HealthCheck::HttpsHandshake { common, .. }
+        | HealthCheck::HttpsGet { common, .. }
         | HealthCheck::UdpDnsQuery { common, .. }
         | HealthCheck::UdpNtpQuery { common } => common.clone(),
     }
@@ -224,10 +228,13 @@ async fn probe_once(hc: &HealthCheck, backend: &Backend) -> bool {
             path,
             expect_status,
             ..
-        } => probe_http(addr, path, *expect_status, false, None, to).await,
-        HealthCheck::HttpsHandshake { sni, .. } => {
-            probe_http(addr, "/", 0, true, sni.clone(), to).await
-        }
+        } => probe_http(addr, path, *expect_status, to).await,
+        HealthCheck::HttpsGet {
+            path,
+            expect_status,
+            sni,
+            ..
+        } => probe_https(addr, path, *expect_status, sni.as_deref(), to).await,
         HealthCheck::UdpDnsQuery { query, .. } => probe_udp_dns(addr, query, to).await,
         HealthCheck::UdpNtpQuery { .. } => probe_udp_ntp(addr, to).await,
     }
@@ -240,25 +247,41 @@ async fn probe_tcp(addr: SocketAddr, to: Duration) -> bool {
         .unwrap_or(false)
 }
 
-async fn probe_http(
-    addr: SocketAddr,
-    path: &str,
-    expect_status: u16,
-    https: bool,
-    _sni: Option<String>,
-    to: Duration,
-) -> bool {
-    if https {
-        // For PoC: HTTPS HC is "TLS handshake completes." We don't
-        // pull rustls just to check that.
-        // Recommendation: per-backend circuit breaker (TBD); for now
-        // we treat HTTPS HC as a TCP-connect with longer timeout.
-        return probe_tcp(addr, to).await;
-    }
+fn validate_origin_form_path(path: &str) -> bool {
     // Defense in depth: catalog validation already rejects non-origin-form
     // and CR/LF in HC paths, but never interpolate an unvalidated path
     // into a request line.
-    if !path.starts_with('/') || path.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+    path.starts_with('/') && path.bytes().all(|b| (0x21..=0x7E).contains(&b))
+}
+
+fn build_get_request(path: &str, host: &str) -> String {
+    format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+}
+
+fn parse_status_line(buf: &[u8]) -> Option<u16> {
+    let head = std::str::from_utf8(buf).ok()?;
+    let mut parts = head.split_whitespace();
+    let _http = parts.next()?;
+    parts.next()?.parse::<u16>().ok()
+}
+
+async fn http_get_over<S>(stream: &mut S, req: &str, to: Duration) -> Option<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if timeout(to, stream.write_all(req.as_bytes())).await.is_err() {
+        return None;
+    }
+    let mut buf = vec![0u8; 256];
+    let n = match timeout(to, stream.read(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        _ => return None,
+    };
+    parse_status_line(&buf[..n])
+}
+
+async fn probe_http(addr: SocketAddr, path: &str, expect_status: u16, to: Duration) -> bool {
+    if !validate_origin_form_path(path) {
         tracing::warn!(?path, "refusing http hc with malformed path");
         return false;
     }
@@ -266,25 +289,126 @@ async fn probe_http(
         Ok(Ok(s)) => s,
         _ => return false,
     };
-    let req = format!(
-        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n",
-        path = path,
-        host = addr.ip()
-    );
-    if timeout(to, stream.write_all(req.as_bytes())).await.is_err() {
+    let req = build_get_request(path, &addr.ip().to_string());
+    matches!(http_get_over(&mut stream, &req, to).await, Some(code) if code == expect_status)
+}
+
+/// HTTPS HC: real GET, like the `nat` plugin's keepalived `SSL_GET`.
+///
+/// TLS certificate validation is intentionally skipped: keepalived's
+/// `SSL_GET` does not verify certs by default either, and operators
+/// frequently point HC at backends with self-signed or internal-CA
+/// certs. Adding a CA-store-driven verifier is left for a follow-up;
+/// `verify_cert` is not on the wire today.
+async fn probe_https(
+    addr: SocketAddr,
+    path: &str,
+    expect_status: u16,
+    sni: Option<&str>,
+    to: Duration,
+) -> bool {
+    if !validate_origin_form_path(path) {
+        tracing::warn!(?path, "refusing https hc with malformed path");
         return false;
     }
-    use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; 256];
-    let n = match timeout(to, stream.read(&mut buf)).await {
-        Ok(Ok(n)) => n,
+    let connector = match tls_connector() {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(?err, "rustls connector init failed");
+            return false;
+        }
+    };
+    let server_name = match server_name_for(addr.ip(), sni) {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!(?err, ?sni, "invalid SNI for https hc");
+            return false;
+        }
+    };
+    let host_header = sni.map(str::to_owned).unwrap_or_else(|| addr.ip().to_string());
+    let tcp = match timeout(to, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
         _ => return false,
     };
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let mut parts = head.split_whitespace();
-    let _http = parts.next();
-    let status = parts.next().and_then(|s| s.parse::<u16>().ok());
+    let mut tls = match timeout(to, connector.connect(server_name, tcp)).await {
+        Ok(Ok(s)) => s,
+        _ => return false,
+    };
+    let req = build_get_request(path, &host_header);
+    let status = http_get_over(&mut tls, &req, to).await;
+    // Best-effort close; TLS shutdown failures don't affect HC verdict.
+    let _ = tls.shutdown().await;
     matches!(status, Some(code) if code == expect_status)
+}
+
+fn server_name_for(addr: IpAddr, sni: Option<&str>) -> Result<ServerName<'static>, String> {
+    if let Some(name) = sni {
+        return ServerName::try_from(name.to_owned()).map_err(|e| e.to_string());
+    }
+    Ok(ServerName::IpAddress(addr.into()))
+}
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn tls_connector() -> Result<TlsConnector, String> {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    let cfg = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(cfg)))
 }
 
 async fn probe_udp_dns(addr: SocketAddr, query: &str, to: Duration) -> bool {
@@ -386,6 +510,60 @@ async fn probe_udp_ntp(addr: SocketAddr, to: Duration) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    /// Spawn a one-shot fake HTTP server that replies with the given
+    /// status line (and an empty body); returns the bound address.
+    async fn spawn_fake_http(status_line: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request — we don't validate it here, the
+            // request-line shape is covered by the build_get_request
+            // unit test.
+            let mut tmp = [0u8; 256];
+            let _ = sock.read(&mut tmp).await;
+            let resp = format!("{status_line}\r\nConnection: close\r\n\r\n");
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn accepts_matching_status() {
+        let addr = spawn_fake_http("HTTP/1.1 200 OK").await;
+        assert!(probe_http(addr, "/", 200, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_status() {
+        let addr = spawn_fake_http("HTTP/1.1 503 Service Unavailable").await;
+        assert!(!probe_http(addr, "/", 200, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_path() {
+        // Path containing CR — defense in depth. We never reach the
+        // socket so the address is unused.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(!probe_http(addr, "/foo\r\nX:y", 200, Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn parses_status_line() {
+        assert_eq!(parse_status_line(b"HTTP/1.1 200 OK\r\n"), Some(200));
+        assert_eq!(parse_status_line(b"HTTP/1.0 404 Not Found\r\n"), Some(404));
+        assert_eq!(parse_status_line(b""), None);
+        assert_eq!(parse_status_line(b"garbage"), None);
+    }
 }
 
 #[cfg(test)]

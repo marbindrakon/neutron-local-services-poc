@@ -240,7 +240,7 @@ chassis, multiple agent restarts in a row, etc.
 **Not in v1.** Health checking is delegated to the exposure plugin —
 Keepalived's TCP_CHECK / HTTP_GET / SSL_GET / MISC_CHECK in the
 `nat` plugin, the proxy worker's built-in HC engine
-(`tcp_connect` / `http_get` / `https_handshake` / `udp_dns_query` /
+(`tcp_connect` / `http_get` / `https_get` / `udp_dns_query` /
 `script`) in the `proxy` plugin. The agent does not run a Python
 health-check probe.
 

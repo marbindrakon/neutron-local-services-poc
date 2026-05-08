@@ -4,7 +4,7 @@ The proxy plugin emits HMAC-signed catalog entries the Rust worker
 consumes. The catalog wire intentionally has a closed set of native
 HC variants — there is no path-execution variant — so the API-side
 HC types must all map to one of {tcp_connect, http_get,
-https_handshake, udp_dns_query, udp_ntp_query}.
+https_get, udp_dns_query, udp_ntp_query}.
 """
 
 import testtools
@@ -48,7 +48,7 @@ class HcForServiceTests(testtools.TestCase):
 
     def test_https(self):
         self.assertEqual(
-            {'type': 'https_handshake'},
+            {'type': 'https_get', 'path': '/'},
             proxy_plugin._hc_for_service(_svc(health_check_type=lsc.HC_HTTPS)))
 
     def test_dns_uses_native_udp_dns_query(self):

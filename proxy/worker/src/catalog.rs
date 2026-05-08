@@ -216,7 +216,9 @@ fn validate(catalog: &Catalog) -> Result<()> {
 
 fn validate_health_check(hc: &HealthCheck) -> Result<()> {
     match hc {
-        HealthCheck::HttpGet { path, .. } => validate_http_origin_form_path(path),
+        HealthCheck::HttpGet { path, .. } | HealthCheck::HttpsGet { path, .. } => {
+            validate_http_origin_form_path(path)
+        }
         _ => Ok(()),
     }
 }

@@ -184,7 +184,7 @@ _LB_ALGO = {
 }
 
 # HC type translation. The worker supports a closed set of native
-# probes: tcp_connect, http_get, https_handshake, udp_dns_query,
+# probes: tcp_connect, http_get, https_get, udp_dns_query,
 # udp_ntp_query. There is intentionally no path-execution variant on
 # the wire — the API surface (HC_TYPES) and the catalog schema agree
 # on this set, so a tampered or buggy catalog cannot ask the worker
@@ -202,7 +202,11 @@ def _hc_for_service(svc):
     if hc_type == lsc.HC_HTTP:
         return {'type': 'http_get', 'path': '/'}
     if hc_type == lsc.HC_HTTPS:
-        return {'type': 'https_handshake'}
+        # Mirrors the `nat` plugin's keepalived SSL_GET: real HTTPS
+        # GET / expecting 200. Worker skips cert verification (same as
+        # keepalived's SSL_GET default), so self-signed / internal-CA
+        # backends work out of the box.
+        return {'type': 'https_get', 'path': '/'}
     if hc_type == lsc.HC_DNS:
         return {'type': 'udp_dns_query'}
     if hc_type == lsc.HC_NTP:

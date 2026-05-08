@@ -54,7 +54,7 @@ The `proxy` plugin trades operational simplicity for richer behavior:
 
 - **HC fidelity.** Built-in active health checks include
   `tcp_connect`, `http_get` (with status-code matching),
-  `https_handshake`, `udp_dns_query`, and a generic `script` type
+  `https_get`, `udp_dns_query`, and a generic `script` type
   that runs the same Keepalived `MISC_CHECK`-compatible probe scripts
   shipped with the package (so DNS and NTP HC scripts are reusable
   across both plugins). Health state surfaces as JSON on the admin
@@ -118,7 +118,7 @@ PoC limitation.
 | --------- | ---------------------------------------- | -------------------------------------- |
 | `tcp`     | `TCP_CHECK`                              | `tcp_connect`                          |
 | `http`    | `HTTP_GET` (status code match)           | `http_get`                             |
-| `https`   | `SSL_GET`                                | `https_handshake`                      |
+| `https`   | `SSL_GET`                                | `https_get`                            |
 | `dns`     | `MISC_CHECK` running `check_dns.sh`      | `udp_dns_query` (built-in) or `script` |
 | `ntp`     | `MISC_CHECK` running `check_ntp.sh`      | `script` running `check_ntp.sh`        |
 | `none`    | no HC                                    | no HC                                  |
