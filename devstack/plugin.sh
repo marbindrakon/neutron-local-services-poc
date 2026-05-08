@@ -88,6 +88,15 @@ Type=simple
 Restart=on-failure
 RestartSec=2
 
+# euid=root for setns + low-port bind, but egid=nls-admin so that
+# (a) systemd creates RuntimeDirectory below as ``root:nls-admin``,
+# closing a startup race against the worker (which depends on the
+# dir being group-writable by nls-admin); (b) sockets the worker
+# creates inside the dir inherit nls-admin via the setgid bit,
+# keeping them reachable by the agent (also nls-admin).
+User=root
+Group=nls-admin
+
 # Caps. setns + low-port bind cover the priv helper's spawn path.
 # CAP_CHOWN lets ExecStartPost chgrp the runtime dir below to
 # nls-admin so the worker (running as ${STACK_USER}, member of
@@ -106,10 +115,10 @@ PrivateTmp=yes
 RuntimeDirectory=neutron-local-services/_proxy
 RuntimeDirectoryMode=2770
 RuntimeDirectoryPreserve=yes
-# RuntimeDirectory= always (re)creates the dir as root:root, so
-# chgrp it to nls-admin every start. Mode 2770 + setgid means
-# sockets the worker creates inside inherit the group, keeping
-# admin/control sockets reachable by the agent (also nls-admin).
+# Belt-and-suspenders chgrp. Group= above already makes systemd
+# create the dir as nls-admin; this ExecStartPost is a no-op on
+# steady-state but recovers if the unit was re-applied without
+# Group= set (older revisions of this script).
 ExecStartPost=/bin/chgrp nls-admin /run/neutron-local-services/_proxy
 
 [Install]
