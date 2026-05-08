@@ -184,8 +184,11 @@ fi
 # 6) End-to-end data path from EACH chassis's tenant client. Both cases
 #    route via the LOCAL chassis's LVS director to the LOCAL backend
 #    (since the remote backend isn't healthy from here).
-OUT_A=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_A_IP" "sudo ip netns exec $MULTICHASSIS_CLIENT_NS curl -sS --max-time 6 http://${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}/" 2>&1)
-OUT_B=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "sudo ip netns exec $MULTICHASSIS_CLIENT_NS curl -sS --max-time 6 http://${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}/" 2>&1)
+# || true so a failing curl (rc=7/28) doesn't abort under set -e — we
+# want to record it as a test failure, not bail out and lose the per-
+# chassis state-independence assertions further down.
+OUT_A=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_A_IP" "sudo ip netns exec $MULTICHASSIS_CLIENT_NS curl -sS --max-time 6 http://${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}/" 2>&1 || true)
+OUT_B=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "sudo ip netns exec $MULTICHASSIS_CLIENT_NS curl -sS --max-time 6 http://${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}/" 2>&1 || true)
 if [[ "$OUT_A" == *"Directory listing"* ]]; then
     pass "tenant on chassis A → VIP reaches local backend"
 else
@@ -208,7 +211,7 @@ KA_PID_B_BEFORE=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "
 ")
 m10mc_remote_backend_kill "$MULTICHASSIS_COMPUTE_A_IP" "$MULTICHASSIS_BACKEND_PORT_A"
 sleep 14
-OUT_B=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "sudo ip netns exec $MULTICHASSIS_CLIENT_NS curl -sS --max-time 6 http://${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}/" 2>&1)
+OUT_B=$(m10mc_ssh "$MULTICHASSIS_COMPUTE_B_IP" "sudo ip netns exec $MULTICHASSIS_CLIENT_NS curl -sS --max-time 6 http://${MULTICHASSIS_SVC_VIP}:${MULTICHASSIS_SVC_PORT}/" 2>&1 || true)
 if [[ "$OUT_B" == *"Directory listing"* ]]; then
     pass "chassis B data path still works after chassis A backend killed (per-chassis state)"
 else
