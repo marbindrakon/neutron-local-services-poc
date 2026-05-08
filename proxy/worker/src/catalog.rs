@@ -260,7 +260,13 @@ fn validate(catalog: &Catalog) -> Result<()> {
 }
 
 fn validate_health_check(hc: &HealthCheck) -> Result<()> {
+    // NoCheck doesn't drive any probe activity, so its HcCommon
+    // floors don't matter — accept it without further checks.
+    if matches!(hc, HealthCheck::NoCheck { .. }) {
+        return Ok(());
+    }
     let common = match hc {
+        HealthCheck::NoCheck { .. } => unreachable!("short-circuited above"),
         HealthCheck::TcpConnect { common }
         | HealthCheck::UdpDnsQuery { common, .. }
         | HealthCheck::UdpNtpQuery { common } => common,

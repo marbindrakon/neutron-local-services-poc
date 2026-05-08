@@ -71,6 +71,15 @@ pub enum LbAlgo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HealthCheck {
+    /// No active probe — the worker treats every backend as Up. Mirrors
+    /// the `nat` plugin's HC_NONE (which renders no keepalived
+    /// MISC_CHECK at all). The plugin emits this when the API caller
+    /// leaves `health_check_type` unset on the service.
+    #[serde(rename = "none")]
+    NoCheck {
+        #[serde(flatten)]
+        common: HcCommon,
+    },
     TcpConnect {
         #[serde(flatten)]
         common: HcCommon,
@@ -142,6 +151,32 @@ fn default_rise_after() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_check_round_trips() {
+        // {"type":"none"} is the wire form for "no health check —
+        // backend is always considered Up". HcCommon fields fall back
+        // to defaults when omitted.
+        let json = r#"{"type":"none"}"#;
+        let hc: HealthCheck = serde_json::from_str(json).unwrap();
+        match hc {
+            HealthCheck::NoCheck { common } => {
+                assert_eq!(common.interval_s, 5);
+                assert_eq!(common.timeout_s, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let back = serde_json::to_string(&HealthCheck::NoCheck {
+            common: HcCommon {
+                interval_s: 5,
+                timeout_s: 2,
+                fail_after: 3,
+                rise_after: 2,
+            },
+        })
+        .unwrap();
+        assert!(back.contains(r#""type":"none""#));
+    }
 
     #[test]
     fn udp_ntp_query_round_trips() {
