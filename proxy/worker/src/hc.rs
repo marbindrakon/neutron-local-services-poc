@@ -570,9 +570,9 @@ mod http_tests {
 mod ntp_tests {
     use super::*;
 
-    /// Spawn a one-shot fake NTP server that returns `reply_first_byte`
-    /// + `reply_stratum` + the supplied transmit-timestamp bytes.
-    /// Returns the bound address.
+    /// Spawn a one-shot fake NTP server that replies with the given
+    /// first byte, stratum, and transmit-timestamp bytes; returns the
+    /// bound address.
     async fn spawn_fake_ntp(
         reply_first_byte: u8,
         reply_stratum: u8,

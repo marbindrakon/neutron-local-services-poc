@@ -130,20 +130,16 @@ mod tests {
         write_frame(&mut buf, &req).unwrap();
         let mut cur = Cursor::new(buf);
         let got: Request = read_frame(&mut cur).unwrap();
-        match got {
-            Request::BindListener {
-                net_id,
-                vip,
-                port,
-                proto,
-            } => {
-                assert_eq!(net_id, "11111111-1111-1111-1111-111111111111");
-                assert_eq!(vip, "fe80::1".parse::<IpAddr>().unwrap());
-                assert_eq!(port, 5353);
-                assert_eq!(proto, Proto::Udp);
-            }
-            _ => panic!("wrong variant"),
-        }
+        let Request::BindListener {
+            net_id,
+            vip,
+            port,
+            proto,
+        } = got;
+        assert_eq!(net_id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(vip, "fe80::1".parse::<IpAddr>().unwrap());
+        assert_eq!(port, 5353);
+        assert_eq!(proto, Proto::Udp);
     }
 
     #[test]
