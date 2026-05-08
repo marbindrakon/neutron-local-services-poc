@@ -147,14 +147,20 @@ for f in "${SELECTED[@]}"; do
         junit_skipped=$((junit_skipped + 1))
         junit_xml+="    <testcase name=\"$case_id\" time=\"$elapsed\"><skipped message=\"$(printf '%s' "$reason" | sed 's/[<>&\"]/_/g')\"/></testcase>"$'\n'
     elif [[ "$rc" -eq 0 ]]; then
-        n_assert=$(awk -F'..' '/^1\.\.[0-9]+/{print $2; exit}' "$log_file")
+        # awk's multi-char -F is a regex (where ".." matches "any 2
+        # chars"), so use sed for the literal "1..N" extraction.
+        n_assert=$(sed -nE 's/^1\.\.([0-9]+).*/\1/p' "$log_file" | head -1)
         printf '%bPASS%b  (%ss) %s assertions\n' "$GRN" "$CLR" "$elapsed" "${n_assert:-0}"
         SUMMARY_LINES+=("$case_id  PASS  ${elapsed}s  ${n_assert:-0} assertions")
         junit_xml+="    <testcase name=\"$case_id\" time=\"$elapsed\"/>"$'\n'
     else
         # Pull the first failed assertion (or bail-out line) for the
         # summary so the operator sees what broke without grepping.
-        first_fail=$(grep -m1 -E '^(not ok|Bail out!)' "$log_file" || echo "(see log)")
+        # The TAP lines start with an ANSI color sequence, so grep with
+        # `^not ok` misses; strip ANSI before/after match.
+        first_fail=$(sed -r 's/\x1b\[[0-9;]*m//g' "$log_file" \
+            | grep -m1 -E '^(not ok|Bail out!)' || true)
+        [[ -z "$first_fail" ]] && first_fail="(see log)"
         printf '%bFAIL%b  (%ss) %s\n' "$RED" "$CLR" "$elapsed" "$first_fail"
         SUMMARY_LINES+=("$case_id  FAIL  ${elapsed}s  $first_fail")
         overall_rc=1

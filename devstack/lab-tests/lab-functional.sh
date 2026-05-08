@@ -38,12 +38,18 @@ fi
 ssh_opts=(-i "${SSH_KEY}" -o StrictHostKeyChecking=no)
 
 # rsync the whole lab-tests tree (cases/, lib/, runner.sh, fixtures).
-# /tmp/lab-tests is a stable scratch path, owned by ${TARGET}'s login
-# user (rsync runs as the SSH user, not stack); the runner is exec'd
-# under stack via sudo -iu below.
+# /tmp/lab-tests is a stable scratch path. The first ssh chowns it
+# back to the SSH user in case a prior run left it owned by stack
+# (otherwise rsync fails with EPERM); rsync runs; the final ssh chowns
+# to stack so the runner can mkdir CASE_TMP under the tree, then exec's
+# runner.sh under stack via sudo -iu.
+ssh "${ssh_opts[@]}" "${TARGET}" \
+    "sudo chown -R \$USER:\$USER /tmp/lab-tests 2>/dev/null || true"
+
 rsync -az --delete -e "ssh ${ssh_opts[*]}" \
     --exclude '__pycache__' \
     "${HERE}/" "${TARGET}:/tmp/lab-tests/"
 
 ssh "${ssh_opts[@]}" "${TARGET}" \
-    "sudo -iu stack bash /tmp/lab-tests/runner.sh '${SELECTOR}' ${RUNNER_ARGS[*]:-}"
+    "sudo chown -R stack:stack /tmp/lab-tests && \
+     sudo -iu stack bash /tmp/lab-tests/runner.sh '${SELECTOR}' ${RUNNER_ARGS[*]:-}"

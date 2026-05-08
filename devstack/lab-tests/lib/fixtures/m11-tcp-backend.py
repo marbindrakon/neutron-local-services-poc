@@ -22,6 +22,14 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
+# SO_REUSEADDR so a TIME_WAIT 4-tuple from a prior run doesn't block
+# the new bind. The proxy worker dials this backend; on case teardown
+# the connection goes to TIME_WAIT for ~60s, which without REUSEADDR
+# blocks the next run from binding.
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
 port = int(sys.argv[1])
-with socketserver.TCPServer(("127.0.0.1", port), H) as srv:
+with ReusableTCPServer(("127.0.0.1", port), H) as srv:
     srv.serve_forever()

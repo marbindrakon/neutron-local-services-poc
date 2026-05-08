@@ -98,6 +98,16 @@ sudo /tmp/m11-tcp-backend.py "$PROXY_TCP_BACKEND_PORT" \
 echo "$!" | sudo tee /tmp/m11-backend.${PROXY_TCP_BACKEND_PORT}.pid >/dev/null
 sleep 1
 
+# Verify the backend is actually listening before we wire it through
+# the proxy. If python died on bind (EADDRINUSE etc.), the proxy
+# tests fail 12s later with a confusing "connection reset" — this
+# fails fast with the actual reason from the script's stderr.
+if ! sudo ss -tlnp 2>/dev/null | grep -q ":${PROXY_TCP_BACKEND_PORT} "; then
+    fail "m11-tcp-backend.py did not bind on 127.0.0.1:${PROXY_TCP_BACKEND_PORT}" \
+         "$(sudo cat /tmp/m11-tcp-backend.${PROXY_TCP_BACKEND_PORT}.log 2>/dev/null | head -10)"
+    exit 0
+fi
+
 # Add the backend. This triggers another reconcile → proxy.py re-emits
 # the catalog with a non-empty entries list → worker accepts and
 # BindListener runs.
