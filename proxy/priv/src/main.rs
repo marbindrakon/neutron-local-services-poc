@@ -29,8 +29,10 @@
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -44,6 +46,16 @@ const DEFAULT_PEER_GROUP: &str = "nls-admin";
 const DEFAULT_CATALOG_PATH: &str = "/var/lib/neutron-local-services/_proxy/catalog.json";
 const DEFAULT_HMAC_KEY_PATH: &str = "/var/lib/neutron-local-services/_proxy/hmac.key";
 const DEFAULT_NONCE_DIR: &str = "/var/lib/neutron-local-services/_proxy/nonces";
+
+/// Cap on simultaneously-served priv connections. The worker is the
+/// only legitimate caller; a handful of in-flight BindListener
+/// threads is the steady-state ceiling. A backlog past this cap
+/// means a stuck peer or a bug.
+const MAX_CONCURRENT_CONNS: usize = 8;
+
+/// Per-recv read deadline. Bounds the time a stalled peer can hold
+/// a connection thread between RPCs.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read-only refs held for the priv process's lifetime and consulted on
 /// every `BindListener`. Cheap to clone (Arc / OwnedFd-as-Arc), so we
@@ -128,6 +140,7 @@ fn main() -> Result<()> {
         "nls-proxy-priv listening"
     );
 
+    let in_flight = Arc::new(AtomicUsize::new(0));
     for client in listener.incoming() {
         match client {
             Ok(stream) => {
@@ -135,13 +148,29 @@ fn main() -> Result<()> {
                     // peer_authorized logs the reason; just drop.
                     continue;
                 }
+                if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
+                    tracing::warn!(error = %e, "set_read_timeout failed; dropping conn");
+                    continue;
+                }
+                let prev = in_flight.fetch_add(1, Ordering::AcqRel);
+                if prev >= MAX_CONCURRENT_CONNS {
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                    tracing::warn!(
+                        in_flight = prev,
+                        cap = MAX_CONCURRENT_CONNS,
+                        "at concurrent-connection cap; dropping accept"
+                    );
+                    continue;
+                }
                 let conn_ctx = priv_ctx.clone();
+                let in_flight_for_thread = Arc::clone(&in_flight);
                 thread::Builder::new()
                     .name("priv-conn".into())
                     .spawn(move || {
                         if let Err(e) = handle_connection(stream, &conn_ctx) {
                             tracing::warn!(error = %e, "client connection ended with error");
                         }
+                        in_flight_for_thread.fetch_sub(1, Ordering::AcqRel);
                     })
                     .context("spawn connection thread")?;
             }

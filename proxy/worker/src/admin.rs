@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -28,6 +29,12 @@ use axum::Json;
 use axum::Router;
 use serde_json::json;
 use tokio::sync::watch;
+
+/// Cap on simultaneously-served admin connections. The local agent
+/// is the only legitimate caller (peer_uid is uid-checked) and
+/// keeps a small pool for scrapes; anything past this cap is a
+/// scraper bug or a stuck handler.
+const MAX_CONCURRENT_CONNS: usize = 16;
 
 use crate::catalog::Catalog;
 use crate::hc::{Status, StatusMap};
@@ -82,6 +89,7 @@ async fn serve(socket_path: PathBuf, state: AdminState) -> Result<()> {
     tracing::info!(path = %socket_path.display(), "admin listening on unix socket");
 
     let our_uid = nix::unistd::geteuid().as_raw();
+    let in_flight = Arc::new(AtomicUsize::new(0));
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -96,7 +104,20 @@ async fn serve(socket_path: PathBuf, state: AdminState) -> Result<()> {
                 continue;
             }
         }
+        let prev = in_flight.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_CONCURRENT_CONNS {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            tracing::warn!(
+                in_flight = prev,
+                cap = MAX_CONCURRENT_CONNS,
+                "admin: at concurrent-connection cap; dropping accept"
+            );
+            // Closing the stream sends FIN; the scraper will retry.
+            drop(stream);
+            continue;
+        }
         let app = app.clone();
+        let in_flight_for_task = Arc::clone(&in_flight);
         tokio::spawn(async move {
             let svc = hyper_util::service::TowerToHyperService::new(app);
             let io = hyper_util::rt::TokioIo::new(stream);
@@ -108,6 +129,7 @@ async fn serve(socket_path: PathBuf, state: AdminState) -> Result<()> {
             {
                 tracing::debug!(error = %e, "admin conn error");
             }
+            in_flight_for_task.fetch_sub(1, Ordering::AcqRel);
         });
     }
 }

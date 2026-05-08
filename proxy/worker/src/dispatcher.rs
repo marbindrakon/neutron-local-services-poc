@@ -5,13 +5,22 @@
 //! either spawns a fresh per-tenant data-path thread or signals an
 //! existing one to shut down. The control socket is mode 0600 owned
 //! by the agent uid (group `nls-admin`).
+//!
+//! Bounded in two places. Concurrent in-flight control connections
+//! are capped at [`MAX_CONCURRENT_CONNS`]: the local agent only ever
+//! holds 1–2 at once, so a backlog past that cap means a stuck
+//! peer. Each accepted connection gets [`READ_TIMEOUT`] applied via
+//! `SO_RCVTIMEO`; a hung peer that opens a connection but never
+//! sends a frame gets reaped instead of pinning a thread forever.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
@@ -21,6 +30,16 @@ use nls_proxy_wire::{ControlRequest, ControlResponse, MAX_FRAME_BYTES};
 use crate::catalog::Catalog;
 use crate::hc::StatusMap;
 use crate::tenant;
+
+/// Cap on simultaneously-served control connections. The agent is
+/// the only legitimate caller and never opens this many; anything
+/// past the cap is a stuck peer or a bug, so we drop the accept and
+/// log instead of spawning more handlers.
+const MAX_CONCURRENT_CONNS: usize = 8;
+
+/// Per-`recvmsg` read deadline applied via `SO_RCVTIMEO`. Bounds
+/// the time a stalled peer can hold a handler thread between RPCs.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Dispatcher {
     pub control_socket: PathBuf,
@@ -54,6 +73,7 @@ impl Dispatcher {
             Arc::new(Mutex::new(HashMap::new()));
 
         let our_uid = nix::unistd::geteuid().as_raw();
+        let in_flight = Arc::new(AtomicUsize::new(0));
 
         for client in listener.incoming() {
             match client {
@@ -61,10 +81,25 @@ impl Dispatcher {
                     if !peer_uid_matches(&stream, our_uid) {
                         continue;
                     }
+                    if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
+                        tracing::warn!(error = %e, "control: set_read_timeout failed; dropping conn");
+                        continue;
+                    }
+                    let prev = in_flight.fetch_add(1, Ordering::AcqRel);
+                    if prev >= MAX_CONCURRENT_CONNS {
+                        in_flight.fetch_sub(1, Ordering::AcqRel);
+                        tracing::warn!(
+                            in_flight = prev,
+                            cap = MAX_CONCURRENT_CONNS,
+                            "control: at concurrent-connection cap; dropping accept"
+                        );
+                        continue;
+                    }
                     let tenants = Arc::clone(&tenants);
                     let priv_socket = self.priv_socket.clone();
                     let catalog_rx = self.catalog_rx.clone();
                     let status_rx = self.status_rx.clone();
+                    let in_flight_for_thread = Arc::clone(&in_flight);
                     std::thread::Builder::new()
                         .name("nls-control-conn".into())
                         .spawn(move || {
@@ -75,6 +110,7 @@ impl Dispatcher {
                                 catalog_rx,
                                 status_rx,
                             );
+                            in_flight_for_thread.fetch_sub(1, Ordering::AcqRel);
                         })
                         .context("spawn control conn thread")?;
                 }

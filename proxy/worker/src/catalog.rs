@@ -34,6 +34,29 @@ pub use nls_proxy_wire::catalog::{
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Worker-enforced upper bounds on catalog shape. The HMAC envelope
+/// guarantees integrity from casual tampering, but a buggy agent or
+/// a compromised signer could still produce a structurally valid but
+/// resource-exhausting catalog. These caps bound the worker's blast
+/// radius regardless: catalog reload fails closed (last-good
+/// snapshot stays in effect) and a metric increments. The numbers
+/// are picked to be ~100× larger than any plausible real chassis
+/// load so legitimate growth never trips them; if they ever do
+/// trip, that's a bug worth investigating, not a tuning problem.
+const MAX_ENTRIES: usize = 4096;
+const MAX_BACKENDS_PER_ENTRY: usize = 256;
+const MAX_TOTAL_BACKENDS: usize = 32_768;
+
+/// Health-check probes are spawned per backend, so an attacker-set
+/// 1-second interval times 32K backends would saturate the runtime.
+/// 1s is a fine floor for a real on-host check; nothing legitimate
+/// runs faster than that.
+const MIN_HC_INTERVAL_S: u32 = 1;
+/// HC timeout has to be smaller than the interval, but also can't be
+/// zero (which would make the probe's own deadline meaningless and
+/// busy-loop the runtime).
+const MIN_HC_TIMEOUT_S: u32 = 1;
+
 /// Spawn an inotify-driven watcher on the catalog directory.
 /// On every `IN_MOVED_TO` (atomic rename land) or modify event,
 /// reparse + reverify and publish the latest `Catalog` over a
@@ -178,7 +201,15 @@ fn validate(catalog: &Catalog) -> Result<()> {
     if catalog.version != 1 {
         bail!("unsupported catalog version: {}", catalog.version);
     }
+    if catalog.entries.len() > MAX_ENTRIES {
+        bail!(
+            "catalog has {} entries, exceeds worker cap of {}",
+            catalog.entries.len(),
+            MAX_ENTRIES
+        );
+    }
     let mut listener_keys: HashSet<(String, IpAddr, u16, nls_proxy_wire::Proto)> = HashSet::new();
+    let mut total_backends: usize = 0;
     for (i, entry) in catalog.entries.iter().enumerate() {
         validate_uuid(&entry.net_id).with_context(|| format!("entries[{i}].net_id"))?;
         validate_uuid(&entry.service_id)
@@ -190,6 +221,20 @@ fn validate(catalog: &Catalog) -> Result<()> {
         }
         if entry.backends.is_empty() {
             bail!("entries[{i}].backends is empty");
+        }
+        if entry.backends.len() > MAX_BACKENDS_PER_ENTRY {
+            bail!(
+                "entries[{i}].backends has {} entries, exceeds per-entry cap of {}",
+                entry.backends.len(),
+                MAX_BACKENDS_PER_ENTRY
+            );
+        }
+        total_backends = total_backends.saturating_add(entry.backends.len());
+        if total_backends > MAX_TOTAL_BACKENDS {
+            bail!(
+                "catalog total backend count exceeds worker cap of {}",
+                MAX_TOTAL_BACKENDS
+            );
         }
         for (j, b) in entry.backends.iter().enumerate() {
             validate_backend_addr(b.addr)
@@ -215,12 +260,41 @@ fn validate(catalog: &Catalog) -> Result<()> {
 }
 
 fn validate_health_check(hc: &HealthCheck) -> Result<()> {
-    match hc {
-        HealthCheck::HttpGet { path, .. } | HealthCheck::HttpsGet { path, .. } => {
-            validate_http_origin_form_path(path)
+    let common = match hc {
+        HealthCheck::TcpConnect { common }
+        | HealthCheck::UdpDnsQuery { common, .. }
+        | HealthCheck::UdpNtpQuery { common } => common,
+        HealthCheck::HttpGet { common, path, .. } => {
+            validate_http_origin_form_path(path)?;
+            common
         }
-        _ => Ok(()),
+        HealthCheck::HttpsGet { common, path, .. } => {
+            validate_http_origin_form_path(path)?;
+            common
+        }
+    };
+    if common.interval_s < MIN_HC_INTERVAL_S {
+        bail!(
+            "interval_s={} is below worker floor of {}s",
+            common.interval_s,
+            MIN_HC_INTERVAL_S
+        );
     }
+    if common.timeout_s < MIN_HC_TIMEOUT_S {
+        bail!(
+            "timeout_s={} is below worker floor of {}s",
+            common.timeout_s,
+            MIN_HC_TIMEOUT_S
+        );
+    }
+    if common.timeout_s > common.interval_s {
+        bail!(
+            "timeout_s={} exceeds interval_s={}; probes would overlap",
+            common.timeout_s,
+            common.interval_s
+        );
+    }
+    Ok(())
 }
 
 /// Reject HTTP request-target paths that aren't origin-form or that
@@ -424,6 +498,103 @@ mod tests {
         let p = write_catalog(dir.path(), &payload, &key());
         let err = load_and_verify(&p, &key()).unwrap_err();
         assert!(format!("{err:#}").contains("loopback"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_oversize_catalog() {
+        let mut entries = Vec::new();
+        for i in 0..(MAX_ENTRIES + 1) {
+            entries.push(serde_json::json!({
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": format!("11223344-5566-7788-99aa-{:012x}", i),
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": format!("169.254.169.{}", (i % 250) + 2),
+                "port": ((i % 60000) as u16) + 1024,
+                "proto": "udp",
+                "backends": [{"addr": "192.0.2.10", "port": 53}],
+                "health_check": {"type": "tcp_connect"}
+            }));
+        }
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": entries,
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds worker cap"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_too_many_backends_per_entry() {
+        let mut backends = Vec::new();
+        for i in 0..(MAX_BACKENDS_PER_ENTRY + 1) {
+            backends.push(serde_json::json!({
+                "addr": format!("192.0.2.{}", (i % 250) + 1),
+                "port": (i as u16) + 1024,
+            }));
+        }
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": [{
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": "11223344-5566-7788-99aa-bbccddeeff00",
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": "169.254.169.10", "port": 53, "proto": "udp",
+                "backends": backends,
+                "health_check": {"type": "tcp_connect"}
+            }]
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("per-entry cap"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_hc_interval_below_floor() {
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": [{
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": "11223344-5566-7788-99aa-bbccddeeff00",
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": "169.254.169.10", "port": 53, "proto": "udp",
+                "backends": [{"addr": "192.0.2.10", "port": 53}],
+                "health_check": {"type": "tcp_connect", "interval_s": 0, "timeout_s": 0}
+            }]
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("below worker floor"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_hc_timeout_exceeding_interval() {
+        let json = serde_json::json!({
+            "version": 1,
+            "generation": 1,
+            "entries": [{
+                "net_id": "00112233-4455-6677-8899-aabbccddeeff",
+                "service_id": "11223344-5566-7788-99aa-bbccddeeff00",
+                "nonce": "n", "nonce_path": "/tmp/n",
+                "vip": "169.254.169.10", "port": 53, "proto": "udp",
+                "backends": [{"addr": "192.0.2.10", "port": 53}],
+                "health_check": {"type": "tcp_connect", "interval_s": 5, "timeout_s": 10}
+            }]
+        });
+        let payload = serde_json::to_vec(&json).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_catalog(dir.path(), &payload, &key());
+        let err = load_and_verify(&p, &key()).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds interval_s"), "{err:#}");
     }
 
     #[test]
