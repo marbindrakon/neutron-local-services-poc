@@ -105,9 +105,14 @@ sleep 18
 # Proxy worker is host-side, so /clusters reflects the configured
 # underlay backend; data path returns real HTML. The admin endpoint
 # requires a bearer token written by the agent at provisioning time.
+#
+# We don't sudo here: the runner already executes as stack, which owns
+# the token file (mode 0400) and matches the worker's effective uid
+# (the admin socket peer-uid gate rejects connections from anyone
+# else, including root — see proxy/worker/src/admin.rs:97).
 PROXY_ADMIN_SOCK="/var/run/neutron-local-services/_proxy/admin.sock"
-PROXY_ADMIN_TOKEN=$(sudo cat /var/lib/neutron-local-services/_proxy/admin.token 2>/dev/null | tr -d '\n')
-CLUSTERS_JSON=$(sudo curl -sS --max-time 3 \
+PROXY_ADMIN_TOKEN=$(cat /var/lib/neutron-local-services/_proxy/admin.token 2>/dev/null | tr -d '\n')
+CLUSTERS_JSON=$(curl -sS --max-time 3 \
     --unix-socket "$PROXY_ADMIN_SOCK" \
     -H "Authorization: Bearer ${PROXY_ADMIN_TOKEN}" \
     "http://localhost/clusters?format=json" 2>&1 || true)
